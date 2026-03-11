@@ -1,0 +1,14 @@
+outputs/
+output/
+data/
+database/
+
+# Local environment/secrets
+.env
+
+# Very large local dataset file
+cleaned_dataset.csv
+
+# Python cache artifacts
+__pycache__/
+*.pyc
