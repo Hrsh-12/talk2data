@@ -7,6 +7,7 @@ The core flow is:
 2. Add month-wise nutrition labels to cleaned child records.
 3. Build a persistent DuckDB table for analytics.
 4. Run natural-language queries and capture SQL traces/results.
+5. (Optional) Use a Gradio chat UI for interactive querying.
 
 ## Pipeline Diagram
 
@@ -26,9 +27,12 @@ data/cleaned_dataset_with_labels.csv
    ▼
 database/nutrition_data.duckdb (table: nutrition_data)
    │
-   ├── scripts/llm_to_sql.py (single or batch)
+   ├── scripts/llm_to_sql.py (single or batch CLI)
+   ├── src/nutrition_sql/service.py (shared query service)
+   ├── apps/gradio_app.py (interactive chat UI)
    ▼
 outputs/llm_to_sql_trace_*.json|.md
+outputs/llm_to_sql_trace_*.json
 ```
 
 ## Pipeline Overview
@@ -105,17 +109,53 @@ python scripts/llm_to_sql.py \
   --output-dir outputs
 ```
 
+Optional comparison input:
+- `--verified-sql-file` to compare generated SQL results against verified SQL by query index.
+
 Batch trace outputs include:
-- LLM input prompt
 - LLM raw output
 - generated SQL
 - SQL execution output/error
+- comparison verdict + diagnostics (`same_result`, `shape_match`, `max_numeric_diff`, tolerance used)
+- generated and verified execution payloads (when available)
 
 Saved to:
 - `outputs/llm_to_sql_trace_<timestamp>.json`
-- `outputs/llm_to_sql_trace_<timestamp>.md`
 - `outputs/llm_to_sql_trace_latest.json`
-- `outputs/llm_to_sql_trace_latest.md`
+
+Notes:
+- LLM routing to hardcoded verified templates is disabled; every query is inferred by the model.
+- Verified SQL parser strips comments/result blocks before extracting executable SQL.
+- Verified SQL coverage now includes queries `Q1`-`Q28` in `data/queries /queries_verified.sql`.
+
+### Step 5: Launch Gradio demo
+
+Run an interactive web app for natural-language nutrition analytics:
+
+```bash
+python apps/gradio_app.py
+```
+
+The current UI is a minimal chat-first interface with:
+- Chat answer (includes a compact result preview)
+- Generated SQL panel
+- Raw SQL output panel
+
+Environment variables (optional):
+- `GRADIO_SERVER_NAME` (default: `127.0.0.1`)
+- `GRADIO_SERVER_PORT` (default: `7860`)
+- `GRADIO_SHARE` (`true`/`false`, default: `false`)
+- `DB_PATH` (default: `database/nutrition_data.duckdb`)
+- `MODEL_NAME` (default: `gpt-5-mini`)
+- `TOP_K` (default: `5`)
+- `TEMPERATURE` (default: `0.0`)
+
+To share quickly with others, start with a temporary public link:
+
+```bash
+GRADIO_SHARE=true python apps/gradio_app.py
+```
+
 
 ## Data and Table Notes
 

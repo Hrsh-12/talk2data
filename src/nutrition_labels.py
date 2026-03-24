@@ -139,18 +139,19 @@ def age_days_to_wasting_band(age_days: int) -> str:
     return "2-5"
 
 
-def classify_stunting(sex: str, age_days: int, height_cm: float | None) -> tuple[str | None, bool]:
+def classify_stunting(sex: str, age_days: int, height_cm: float | None) -> tuple[str | None, bool | None]:
     """
     Returns (stunting_status, is_stunted).
     status: 'normal' | 'moderately_stunted' | 'severely_stunted'
+    is_stunted is None when classification inputs are missing/invalid.
     """
     if height_cm is None or height_cm <= 0:
-        return None, False
+        return None, None
     sex = "M" if sex not in ("M", "F") else sex
     table = _get_stunting_table()
     row = _nearest_day(sex, age_days, table)
     if row is None:
-        return None, False
+        return None, None
     h_severe_max, h_normal_min = row
     if height_cm <= h_severe_max:
         return "severely_stunted", True
@@ -159,18 +160,19 @@ def classify_stunting(sex: str, age_days: int, height_cm: float | None) -> tuple
     return "normal", False
 
 
-def classify_underweight(sex: str, age_days: int, weight_kg: float | None) -> tuple[str | None, bool]:
+def classify_underweight(sex: str, age_days: int, weight_kg: float | None) -> tuple[str | None, bool | None]:
     """
     Returns (underweight_status, is_underweight).
     status: 'normal' | 'moderately_underweight' | 'severely_underweight'
+    is_underweight is None when classification inputs are missing/invalid.
     """
     if weight_kg is None or weight_kg <= 0:
-        return None, False
+        return None, None
     sex = "M" if sex not in ("M", "F") else sex
     table = _get_underweight_table()
     row = _nearest_day(sex, age_days, table)
     if row is None:
-        return None, False
+        return None, None
     w_severe_max, w_normal_min = row
     if weight_kg <= w_severe_max:
         return "severely_underweight", True
@@ -179,19 +181,25 @@ def classify_underweight(sex: str, age_days: int, weight_kg: float | None) -> tu
     return "normal", False
 
 
-def classify_wasting(sex: str, age_days: int, height_cm: float | None, weight_kg: float | None) -> tuple[str | None, bool, bool]:
+def classify_wasting(
+    sex: str,
+    age_days: int,
+    height_cm: float | None,
+    weight_kg: float | None,
+) -> tuple[str | None, bool | None, bool | None]:
     """
     Returns (wasting_status, is_wasted, is_sam).
     status: 'SAM' | 'MAM' | 'normal' | 'overweight' | 'obese'
+    is_wasted/is_sam are None when classification inputs are missing/invalid.
     """
     if height_cm is None or height_cm <= 0 or weight_kg is None or weight_kg <= 0:
-        return None, False, False
+        return None, None, None
     sex = "M" if sex not in ("M", "F") else sex
     age_band = age_days_to_wasting_band(age_days)
     table = _get_wasting_table()
     row = _nearest_height(sex, age_band, height_cm, table)
     if row is None:
-        return None, False, False
+        return None, None, None
     sam_upper, mam_upper, normal_upper, overweight_upper = row
     if weight_kg <= sam_upper:
         return "SAM", True, True

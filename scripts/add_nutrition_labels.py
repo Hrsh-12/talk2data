@@ -59,13 +59,37 @@ def _safe_positive_float(value) -> float | None:
 def _default_label_dict() -> dict:
     return {
         "stunting_status": None,
-        "is_stunted": False,
+        "is_stunted": None,
         "underweight_status": None,
-        "is_underweight": False,
+        "is_underweight": None,
         "wasting_status": None,
-        "is_wasted": False,
-        "is_sam": False,
+        "is_wasted": None,
+        "is_sam": None,
     }
+
+
+def _drop_zero_measurement_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Drop rows where any height/weight measurement is exactly zero."""
+    measurement_cols = []
+    for month in MONTH_CONFIG:
+        for metric in ("height", "weight"):
+            col = f"{month}_{metric}"
+            if col in df.columns:
+                measurement_cols.append(col)
+
+    if not measurement_cols:
+        return df, 0
+
+    zero_mask = pd.Series(False, index=df.index)
+    for col in measurement_cols:
+        numeric_col = pd.to_numeric(df[col], errors="coerce")
+        zero_mask = zero_mask | (numeric_col == 0)
+
+    dropped_count = int(zero_mask.sum())
+    if dropped_count == 0:
+        return df, 0
+
+    return df.loc[~zero_mask].copy(), dropped_count
 
 
 def _label_month(df: pd.DataFrame, month: str) -> list[dict]:
@@ -134,10 +158,23 @@ def add_labels(input_csv: Path, output_csv: Path, chunksize: int = 50_000) -> No
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     wrote_header = False
+    total_dropped = 0
 
     chunk_iter = pd.read_csv(input_csv, low_memory=False, chunksize=chunksize)
     for chunk_idx, df in enumerate(chunk_iter, start=1):
-        print(f"Processing chunk {chunk_idx} with {len(df):,} rows")
+        original_chunk_rows = len(df)
+        df, dropped_count = _drop_zero_measurement_rows(df)
+        total_dropped += dropped_count
+
+        print(
+            f"Processing chunk {chunk_idx} with {original_chunk_rows:,} rows "
+            f"({dropped_count:,} dropped, {len(df):,} kept)"
+        )
+
+        if df.empty:
+            print(f"Skipped chunk {chunk_idx}: no rows left after zero-measurement filtering")
+            continue
+
         for month in MONTH_CONFIG:
             _apply_month_labels(df, month)
 
@@ -146,6 +183,7 @@ def add_labels(input_csv: Path, output_csv: Path, chunksize: int = 50_000) -> No
         wrote_header = True
         print(f"Wrote chunk {chunk_idx}")
 
+    print(f"Total rows dropped (zero height/weight): {total_dropped:,}")
     print(f"Saved labeled CSV: {output_csv}")
 
 

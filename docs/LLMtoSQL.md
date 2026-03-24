@@ -4,7 +4,7 @@ This document reflects the implemented PoC architecture (not just the initial pl
 
 ## Implemented architecture
 
-The workflow is split into two scripts:
+The current workflow has three serving layers:
 
 1. `scripts/build_nutrition_db.py`
    - Reads `data/cleaned_dataset_with_labels.csv`
@@ -12,11 +12,16 @@ The workflow is split into two scripts:
    - Persists DuckDB file: `database/nutrition_data.duckdb`
    - Writes table: `nutrition_data`
 
-2. `scripts/llm_to_sql.py`
-   - Connects to saved DB (`database/nutrition_data.duckdb`)
-   - Creates LangChain SQL agent (`create_sql_agent`) over DuckDB
-   - Runs NL questions against `nutrition_data`
-   - Uses schema + sample row grounding in prompt
+2. `src/nutrition_sql/service.py`
+   - Shared LLM-to-SQL core logic (prompting, SQL extraction, execution, repair, traces)
+   - Batch comparison utilities against verified SQL (`queries_verified.sql`)
+   - Robust verified SQL parsing (ignores comments and stored result blocks)
+   - Structured result comparison with numeric tolerance and shape diagnostics
+   - Read-only SQL guard (`SELECT`/`WITH`)
+
+3. Client entrypoints
+   - `scripts/llm_to_sql.py`: CLI wrapper around service
+   - `apps/gradio_app.py`: interactive Gradio chat UI
 
 ## Environment
 
@@ -26,7 +31,7 @@ conda activate eda
 pip install -r requirements.txt
 ```
 
-Core libs used: `duckdb`, `pandas`, `langchain`, `langchain-community`, `langchain-openai`, `duckdb-engine`, `sqlalchemy<2`, `python-dotenv`.
+Core libs used: `duckdb`, `pandas`, `langchain`, `langchain-community`, `langchain-openai`, `duckdb-engine`, `sqlalchemy<2`, `python-dotenv`, `gradio`.
 
 ## Business rules in prompt grounding
 
@@ -57,9 +62,40 @@ Run LLM query:
 python scripts/llm_to_sql.py --db database/nutrition_data.duckdb --top-k 5 "Top 5 districts by SAM reduction from Feb to Mar"
 ```
 
+Run batch comparison against verified SQL:
+
+```bash
+python scripts/llm_to_sql.py \
+  --db database/nutrition_data.duckdb \
+  --queries-file "data/queries /queries.txt" \
+  --verified-sql-file "data/queries /queries_verified.sql"
+```
+
+Behavior notes:
+- LLM inference is always used (no verified-template routing).
+- Comparison payload includes `same_result`, `shape_match`, `max_numeric_diff`, and tolerance metadata.
+- `queries_verified.sql` currently includes verified mappings/results for `Q1` through `Q28`.
+
+Run Gradio chat app:
+
+```bash
+python apps/gradio_app.py
+```
+
+Temporary public link:
+
+```bash
+GRADIO_SHARE=true python apps/gradio_app.py
+```
+
 ## Outputs
 
-Batch run outputs are stored at:
+Trace files are stored at:
 
-- `outputs/llm_to_sql_batch_results.md`
-- `outputs/llm_to_sql_batch_results.json`
+- `outputs/llm_to_sql_trace_<timestamp>.json`
+- `outputs/llm_to_sql_trace_latest.json`
+
+The Gradio app currently surfaces:
+- chat response with compact result preview
+- generated SQL panel
+- raw SQL output panel

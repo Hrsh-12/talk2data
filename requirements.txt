@@ -3,7 +3,7 @@
 PyPDF2>=3.0.0
 pandas>=2.0.0
 duckdb>=0.9.0
-pygrowup>=0.8.2
+# pygrowup>=0.8.2
 openai>=1.0.0
 python-dotenv>=1.0.0
 langchain>=1.0.0
@@ -11,3 +11,4 @@ langchain-community>=0.4.0
 langchain-openai>=1.1.0
 duckdb-engine>=0.17.0
 sqlalchemy<2
+gradio>=5.0.0
