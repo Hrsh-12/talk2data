@@ -29,7 +29,7 @@ Schema context:
 Business grounding:
 - Month prefixes: `feb24_`, `mar24_`, `apr24_`.
 - Use indicator/status columns already present in the table; do not invent derived definitions.
-- If asked for haemoglobin (Hb) values, return SQL that indicates the dataset does not contain Hb testing data.
+- You have data from feb24, mar24, and apr24, do not answer questions about other months.
 
 Hard SQL rules:
 1) Return exactly one read-only DuckDB query (`SELECT` or `WITH`).
@@ -127,7 +127,8 @@ def _execute_sql(db: SQLDatabase, sql: str) -> dict[str, Any]:
             "error": "Blocked non-read-only SQL. Only SELECT/WITH statements are allowed.",
         }
     try:
-        raw_output = db.run(sql)
+        # Include column names so downstream UIs can render proper headers.
+        raw_output = db.run(sql, include_columns=True)
         return {"ok": True, "raw_output": raw_output, "error": None}
     except Exception as exc:
         return {"ok": False, "raw_output": None, "error": str(exc)}
