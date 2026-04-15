@@ -28,7 +28,7 @@ from config import (
 
 def _format_scalar(value: object) -> str:
     if isinstance(value, float):
-        return f"{value:.4f}"
+        return f"{value:.2f}"
     if value is None:
         return "null"
     return str(value)
@@ -260,6 +260,11 @@ def build_result_table(
     else:
         df = pd.DataFrame({"value": [parsed]})
 
+    # Round all float columns to 2 decimal places for display.
+    float_cols = df.select_dtypes(include="float").columns
+    if len(float_cols):
+        df[float_cols] = df[float_cols].round(2)
+
     shown_n, cols_n = int(df.shape[0]), int(df.shape[1])
     rows_line = (
         f"**Rows**: {total_rows} (showing first {shown_n})"
@@ -276,6 +281,14 @@ def build_result_table(
         cell = df.iloc[0, 0]
         if isinstance(cell, (int, float)) and not isinstance(cell, bool):
             summary_lines.insert(2, f"## {_format_scalar(cell)}")
+
+    if executed_sql and executed_sql.strip():
+        summary_lines += [
+            "",
+            "---",
+            "**Generated SQL**",
+            f"```sql\n{executed_sql.strip()}\n```",
+        ]
 
     return df, "\n".join(summary_lines)
 

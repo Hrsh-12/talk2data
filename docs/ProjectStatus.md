@@ -250,3 +250,15 @@ flowchart TD
 | `docs/` | 6+ | — | Documentation |
 | `outputs/` | 0 (gitignored) | `*.json` traces | LLM traces |
 | Root | 3 (`README.md`, `requirements.txt`, `.gitignore`) | `.env` | Config |
+
+
+
+
+## TODO(Suggestions) 
+1. Selective Patch from the DB ( Avoid Select * type statements)
+2. Add Logging for the Codebase (INFO, ERROR, CRITICAL levels)
+  Ex: LLM Generated Query, SQL Results in INFO 
+3. Need Sample Queries - Query, SQL, Natural Language Answer (Tonality, Formatting). [>50]
+
+
+
