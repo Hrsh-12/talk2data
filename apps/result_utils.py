@@ -6,21 +6,40 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 from functools import lru_cache
 from pathlib import Path
 
 import duckdb
 import pandas as pd
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
-from config import (
-    DEFAULT_DB_PATH,
-    REPHRASE_MAX_RETRIES,
-    REPHRASE_MAX_TOKENS,
-    REPHRASE_MODEL,
-    REPHRASE_TEMPERATURE,
-    REPHRASE_TIMEOUT_SECONDS,
+from pipeline.sql.text import is_read_only_sql
+
+
+def _default_db_path() -> Path:
+    return Path(os.getenv("DB_PATH", "database/nutrition_data.duckdb"))
+
+
+# LangChain: system = rules, human = question + JSON payload (structured chat messages).
+REPHRASE_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are a data assistant. Rewrite SQL results as a concise direct answer.
+Rules:
+1) Use only the provided result payload. Never invent fields, values, or causes.
+2) Keep output to 1-2 short sentences in plain English.
+3) Do not include markdown, SQL, or bullet points.
+4) If the payload is scalar, provide the numeric answer clearly. With at most 2 decimal places.
+5) If the payload has rows, summarize key values in sentence form.
+6) If unsure, state limitation briefly and stay factual.""",
+        ),
+        ("human", "User question:\n{question}\n\nResult payload (JSON):\n{payload_json}"),
+    ]
 )
 
 
@@ -202,14 +221,9 @@ def _parse_exec_output(raw_output: object) -> tuple[str, object]:
         return text, text
 
 
-def _is_read_only_sql(sql: str) -> bool:
-    normalized = sql.strip().lower().lstrip("(")
-    return normalized.startswith("select") or normalized.startswith("with")
-
-
 def _columns_for_sql(db_path: Path, sql: str) -> list[str] | None:
     cleaned = sql.strip()
-    if not cleaned or not _is_read_only_sql(cleaned):
+    if not cleaned or not is_read_only_sql(cleaned):
         return None
     wrapped = f"SELECT * FROM ({cleaned.rstrip(';')}) AS q LIMIT 0;"
     try:
@@ -227,12 +241,14 @@ def build_result_table(
     executed_sql: str,
     exec_payload: dict,
     max_rows: int,
-    db_path: Path = DEFAULT_DB_PATH,
+    db_path: Path | None = None,
 ) -> tuple[pd.DataFrame, str]:
     """
     Convert already-executed SQL output into a display DataFrame + summary markdown.
     Uses a LIMIT 0 probe to recover column names when needed.
     """
+    if db_path is None:
+        db_path = _default_db_path()
     safe_limit = max(1, int(max_rows))
 
     if not exec_payload.get("ok"):
@@ -353,7 +369,16 @@ def _fallback_reply(question: str, exec_payload: dict) -> str:
     return f"I ran the SQL successfully. Result: {compact}"
 
 
-def rephrase_reply(question: str, exec_payload: dict) -> str:
+def rephrase_reply(
+    question: str,
+    exec_payload: dict,
+    *,
+    model: str = "gpt-4o-mini",
+    temperature: float = 0.0,
+    max_tokens: int = 96,
+    timeout_seconds: float = 20.0,
+    max_retries: int = 1,
+) -> str:
     """Return a 1-2 sentence natural-language answer rephrased by the LLM."""
     if not exec_payload.get("ok"):
         return _fallback_reply(question, exec_payload)
@@ -362,28 +387,19 @@ def rephrase_reply(question: str, exec_payload: dict) -> str:
     if payload["status"] == "empty":
         return _fallback_reply(question, exec_payload)
 
-    prompt = (
-        "You are a data assistant. Rewrite SQL results as a concise direct answer.\n"
-        "Rules:\n"
-        "1) Use only the provided result payload. Never invent fields, values, or causes.\n"
-        "2) Keep output to 1-2 short sentences in plain English.\n"
-        "3) Do not include markdown, SQL, or bullet points.\n"
-        "4) If the payload is scalar, provide the numeric answer clearly. With at most 2 decimal places.\n"
-        "5) If the payload has rows, summarize key values in sentence form.\n"
-        "6) If unsure, state limitation briefly and stay factual.\n\n"
-        f"User question:\n{question}\n\n"
-        "Result payload (JSON):\n"
-        f"{json.dumps(payload, ensure_ascii=True, default=str)}\n"
-    )
+    payload_json = json.dumps(payload, ensure_ascii=True, default=str)
     try:
         llm = _chat_llm(
-            model=REPHRASE_MODEL,
-            temperature=REPHRASE_TEMPERATURE,
-            max_tokens=REPHRASE_MAX_TOKENS,
-            timeout_seconds=REPHRASE_TIMEOUT_SECONDS,
-            max_retries=REPHRASE_MAX_RETRIES,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
         )
-        content = str(getattr(llm.invoke(prompt), "content", "")).strip()
+        chain = REPHRASE_PROMPT | llm | StrOutputParser()
+        content = chain.invoke(
+            {"question": question, "payload_json": payload_json},
+        ).strip()
         return " ".join(content.split()) if content else _fallback_reply(question, exec_payload)
     except Exception:
         return _fallback_reply(question, exec_payload)

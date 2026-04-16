@@ -63,7 +63,7 @@ flowchart TD
 #### Stage 2 — Nutrition Labeling
 - **Script:** `scripts/add_nutrition_labels.py`
 - **Input:** Cleaned CSV + lookup tables (from Stage 0)
-- **Process:** Streams in 50k-row chunks. For each row and each month (`feb24`, `mar24`, `apr24`), calls `classify_all()` from `src/nutrition_labels.py`. Drops rows with zero height/weight.
+- **Process:** Streams in 50k-row chunks. For each row and each month (`feb24`, `mar24`, `apr24`), calls `classify_all()` from `pipeline/nutrition_labels.py`. Drops rows with zero height/weight.
 - **Output:** `data/cleaned_dataset_with_labels.csv` (~3.64M rows, 46 columns)
 - **Runtime:** Significant — row-by-row classification over 3.6M × 3 months.
 
@@ -75,7 +75,7 @@ flowchart TD
 - **Note:** Loads entire CSV into memory. For the 3.6M-row dataset this requires ~4–8 GB RAM.
 
 #### Stage 4 — LLM-to-SQL Query
-- **Service:** `src/nutrition_sql/service.py`
+- **Service:** `pipeline/service.py`
 - **Process:**
   1. Cache schema introspection + 3 sample rows from DuckDB
   2. Build grounded prompt with business rules and SQL patterns
@@ -106,12 +106,13 @@ flowchart TD
 |-----------|--------|-------|
 | `scripts/parse_assessment_pdfs.py` | ✅ Functional | Produces correct lookup CSVs; idempotent. |
 | `scripts/add_nutrition_labels.py` | ✅ Functional | Chunked streaming; handles edge cases (zero metrics, missing DOB). |
-| `src/nutrition_labels.py` | ✅ Functional | Complete classification engine with nearest-neighbor interpolation for missing lookup keys. |
+| `pipeline/nutrition_labels.py` | ✅ Functional | Complete classification engine with nearest-neighbor interpolation for missing lookup keys. |
 | `scripts/build_nutrition_db.py` | ✅ Functional | Clean DuckDB build with bool normalization. |
-| `src/nutrition_sql/service.py` | ✅ Functional | Full NL→SQL pipeline with repair loop and benchmarking support. |
+| `pipeline/service.py` | ✅ Functional | Full NL→SQL pipeline with repair loop and benchmarking support. |
 | `scripts/llm_to_sql.py` | ✅ Functional | CLI supports single and batch modes with trace output. |
 | `apps/gradio_app.py` | ✅ Functional | Chat UI with result tables, rephrasing, and ground-truth reference. |
 | `data/queries/queries_verified.sql` | ✅ Complete | 28 benchmark queries (Q1–Q28) with verified results. |
+| **Automated tests (`tests/`)** | ✅ In place | Pytest for SQL helpers, DuckDB execution, path resolution, benchmarks, Gradio `build_app`, result/rephrase helpers; optional `requires_db` checks. See §3.4. |
 
 ### 3.2 Work-in-Progress / Incomplete
 
@@ -119,7 +120,6 @@ flowchart TD
 |-----------|--------|----------|
 | **Data cleaning automation** | 🔶 WIP | Cleaning is done in a notebook (`01_initial_exploration.ipynb`) with a `KeyboardInterrupt` in the saved labeling cell. No script equivalent for the cleaning step exists. |
 | **Normalized DB schema** | 🔶 Abandoned | `docs/PROJECT.md` describes a multi-table design (`beneficiaries`, `monthly_measurements`, lookup tables). `notebooks/01_explore.ipynb` validates a `child_health.duckdb` with this schema. The current pipeline only builds the flat `nutrition_data` table. |
-| **`src/utils.py`** | 🔶 Dead code | Defines `load_csv()` and `summarize()` but is never imported. |
 | **`prefer_verified_templates` routing** | 🔶 Disabled | Parameter exists in `run_single_question()` signature but is a documented no-op (`_ = prefer_verified_templates`). Template routing was removed. |
 | **`district_mapping.csv` integration** | 🔶 Unused in code | File exists but no script or service code imports or joins it. Some verified SQL references `district_name` which would require this mapping. |
 
@@ -127,14 +127,21 @@ flowchart TD
 
 | Gap | Impact | Recommendation |
 |-----|--------|----------------|
-| **No test suite** | High — regressions are undetectable. | Add pytest tests for `classify_all()`, `_extract_sql()`, `_is_read_only_sql()`, and integration tests for the SQL pipeline. |
-| **No CI/CD** | High — no automated quality gates. | Add GitHub Actions for linting, testing, and (optionally) building the DuckDB from a small test CSV. |
+| **No CI/CD** | High — no automated quality gates. | Add GitHub Actions (or similar) to run `PYTHONPATH=. pytest tests/ -m "not requires_db"` on each push; optionally add a job with a small fixture DuckDB for `requires_db`. |
 | **No containerization** | Medium — environment reproducibility risk. | Add a `Dockerfile` and `docker-compose.yml` for the Gradio app + DuckDB. |
 | **No structured logging** | Medium — debugging is limited to `print()`. | Adopt Python `logging` with structured output. |
 | **No data validation** | Medium — schema drift is undetected. | Add a validation step (e.g., Great Expectations or a simple assertion script) between labeling and DB build. |
 | **No error monitoring** | Low — LLM failures are swallowed silently. | Add error tracking (Sentry, or at minimum file-based error logs). |
-| **`tqdm` missing from requirements** | Low — install may fail. | Add `tqdm>=4.0.0` to `requirements.txt`. |
 | **Space in `data/queries /` dirname** | Low — fragile. | Rename to `data/queries/` (no trailing space). |
+
+### 3.4 Automated testing
+
+| Item | Detail |
+|------|--------|
+| **Layout** | `tests/test_nutrition_sql_pure.py` — `extract_sql`, `normalize_sql`, benchmark parsing/comparison. `tests/test_pipeline_units.py` — read-only SQL checks, temp DuckDB, `resolve_config_path`, runner preflight, Gradio build smoke, result helpers (mocks where needed). `tests/test_connectivity_inference.py` — optional DuckDB file checks (`RUN_CONNECTIVITY=1`, marker `requires_db`). `tests/conftest.py` — skips connectivity tests unless opted in. |
+| **Docs** | Catalog and test IDs: [TestSuite.md](TestSuite.md). |
+| **Run** | From repo root: `PYTHONPATH=. python -m pytest tests/` (see [README.md](../README.md) for `-m "not requires_db"` and connectivity). |
+| **Not covered in CI by default** | Live OpenAI, full NL→SQL end-to-end, and Hydra `compose` are not exercised in the current test set (Hydra-only tests were removed; app config is still loaded at runtime via `@hydra.main` / `compose` in scripts). |
 
 ---
 
@@ -147,15 +154,18 @@ flowchart TD
 conda activate eda                          # or: python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Create .env with API key
+# 2. Create .env with API key (required for LLM CLI / Gradio)
 echo "OPENAI_API_KEY=sk-..." > .env
 
-# 3. Place source PDFs in data/ (if lookup CSVs don't exist yet)
+# 3. (Optional) Run tests — see README.md
+# PYTHONPATH=. python -m pytest tests/
+
+# 4. Place source PDFs in data/ (if lookup CSVs don't exist yet)
 #    StuntedAssessmentParameters.pdf
 #    UnderweightAssessmentParameters.pdf
 #    WastedAssessmentParameters.pdf
 
-# 4. Place cleaned_dataset.csv in data/ (produced via notebook or external process)
+# 5. Place cleaned_dataset.csv in data/ (produced via notebook or external process)
 ```
 
 ### 4.2 Pipeline Execution (Sequential)
@@ -239,17 +249,19 @@ flowchart TD
 
 ## 5. File Inventory
 
-| Directory | Tracked Files | Gitignored Content | Role |
-|-----------|--------------|-------------------|------|
-| `apps/` | 1 | — | Web UI |
-| `scripts/` | 4 | — | ETL pipeline |
-| `src/` | 5 | — | Core library |
-| `data/` | 0 (gitignored) | ~8 CSVs, 2 text/SQL, 3 PDFs | Data assets |
-| `database/` | 1 (`.gitkeep`) | `*.duckdb` files | Analytics DB |
+| Directory | Tracked files (representative) | Gitignored content | Role |
+|-----------|-------------------------------|-------------------|------|
+| `apps/` | `gradio_app.py`, `config.py`, `result_utils.py`, `ui_content.py` | — | Gradio UI and helpers |
+| `scripts/` | 4 × `*.py` (parse, label, build DB, `llm_to_sql`) | — | ETL + CLI query |
+| `pipeline/` | Library modules (`service`, `db`, `llm`, `execution`, …) | — | NL→SQL + shared logic |
+| `conf/` | Hydra YAML (`config.yaml`, `paths`, `llm`, `rephrase`, `gradio`) | — | Defaults for app/CLI |
+| `tests/` | `test_nutrition_sql_pure.py`, `test_pipeline_units.py`, `test_connectivity_inference.py`, `conftest.py` | — | Pytest |
+| Root | `README.md`, `requirements.txt`, `pytest.ini`, `.gitignore`, … | `.env` | Docs + tooling |
+| `data/` | Often empty in git | CSVs, PDFs, queries | Data assets |
+| `database/` | `.gitkeep` | `*.duckdb` | Built analytics DB |
 | `notebooks/` | 3 | — | EDA |
-| `docs/` | 6+ | — | Documentation |
-| `outputs/` | 0 (gitignored) | `*.json` traces | LLM traces |
-| Root | 3 (`README.md`, `requirements.txt`, `.gitignore`) | `.env` | Config |
+| `docs/` | `Codebase.md`, `ProjectStatus.md`, `TestSuite.md` | — | Documentation |
+| `outputs/` | — | `*.json` traces | LLM traces |
 
 
 

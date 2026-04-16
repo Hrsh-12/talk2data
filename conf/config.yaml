@@ -1,0 +1,10 @@
+defaults:
+  - paths: default
+  - llm: default
+  - rephrase: default
+  - gradio: default
+  - _self_
+
+hydra:
+  job:
+    chdir: false

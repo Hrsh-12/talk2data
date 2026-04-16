@@ -1,0 +1,5 @@
+model: gpt-4o-mini
+temperature: 0.0
+max_tokens: 96
+timeout_seconds: 20.0
+max_retries: 1

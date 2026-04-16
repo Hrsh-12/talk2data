@@ -1,0 +1,4 @@
+# Repo-relative paths; override with Hydra or set env vars (DB_PATH, VERIFIED_SQL_PATH, OUTPUT_DIR).
+db_path: ${oc.env:DB_PATH,database/nutrition_data.duckdb}
+verified_sql_path: ${oc.env:VERIFIED_SQL_PATH,'data/queries /queries_verified.sql'}
+output_dir: ${oc.env:OUTPUT_DIR,outputs}

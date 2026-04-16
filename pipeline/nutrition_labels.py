@@ -10,46 +10,52 @@ Definitions:
 - Wasting / SAM / MAM: weight-for-height; compare child's weight to thresholds for (sex, age_band, height_cm).
 """
 
-from pathlib import Path
+from __future__ import annotations
+
 import csv
+from functools import lru_cache
+from pathlib import Path
 
 # Default paths relative to project root
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 
-def _load_stunting_lookup(path: Path | None = None) -> dict[tuple[str, int], tuple[float, float]]:
-    """(sex, day) -> (h_severe_max, h_normal_min)."""
-    path = path or PROCESSED_DIR / "stunting_lookup.csv"
-    out = {}
+def _load_sex_day_pair_csv(
+    path: Path,
+    severe_field: str,
+    normal_field: str,
+) -> dict[tuple[str, int], tuple[float, float]]:
+    """(sex, day) -> (severe_threshold, normal_threshold)."""
+    out: dict[tuple[str, int], tuple[float, float]] = {}
     with open(path) as f:
-        r = csv.DictReader(f)
-        for row in r:
+        reader = csv.DictReader(f)
+        for row in reader:
             key = (row["sex"].strip().upper() or "M", int(row["day"]))
-            out[key] = (float(row["h_severe_max"]), float(row["h_normal_min"]))
+            out[key] = (float(row[severe_field]), float(row[normal_field]))
     return out
 
 
-def _load_underweight_lookup(path: Path | None = None) -> dict[tuple[str, int], tuple[float, float]]:
-    """(sex, day) -> (w_severe_max, w_normal_min)."""
-    path = path or PROCESSED_DIR / "underweight_lookup.csv"
-    out = {}
-    with open(path) as f:
-        r = csv.DictReader(f)
-        for row in r:
-            key = (row["sex"].strip().upper() or "M", int(row["day"]))
-            out[key] = (float(row["w_severe_max"]), float(row["w_normal_min"]))
-    return out
+@lru_cache(maxsize=4)
+def _stunting_table_cached(resolved_path: str) -> dict[tuple[str, int], tuple[float, float]]:
+    return _load_sex_day_pair_csv(Path(resolved_path), "h_severe_max", "h_normal_min")
 
 
-def _load_wasting_lookup(path: Path | None = None) -> dict[tuple[str, str, float], tuple[float, float, float, float]]:
+@lru_cache(maxsize=4)
+def _underweight_table_cached(resolved_path: str) -> dict[tuple[str, int], tuple[float, float]]:
+    return _load_sex_day_pair_csv(Path(resolved_path), "w_severe_max", "w_normal_min")
+
+
+@lru_cache(maxsize=4)
+def _wasting_table_cached(
+    resolved_path: str,
+) -> dict[tuple[str, str, float], tuple[float, float, float, float]]:
     """(sex, age_band, height_cm) -> (sam_upper, mam_upper, normal_upper, overweight_upper)."""
-    path = path or PROCESSED_DIR / "wasting_lookup.csv"
-    out = {}
-    with open(path) as f:
-        r = csv.DictReader(f)
-        for row in r:
-            sex = (row["sex"].strip().upper() or "M")
+    out: dict[tuple[str, str, float], tuple[float, float, float, float]] = {}
+    with open(Path(resolved_path)) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            sex = row["sex"].strip().upper() or "M"
             age_band = row["age_band"].strip()
             height_cm = round(float(row["height_cm"]), 1)
             key = (sex, age_band, height_cm)
@@ -60,33 +66,6 @@ def _load_wasting_lookup(path: Path | None = None) -> dict[tuple[str, str, float
                 float(row["overweight_upper"]),
             )
     return out
-
-
-# Module-level caches (lazy load)
-_stunting: dict | None = None
-_underweight: dict | None = None
-_wasting: dict | None = None
-
-
-def _get_stunting_table():
-    global _stunting
-    if _stunting is None:
-        _stunting = _load_stunting_lookup()
-    return _stunting
-
-
-def _get_underweight_table():
-    global _underweight
-    if _underweight is None:
-        _underweight = _load_underweight_lookup()
-    return _underweight
-
-
-def _get_wasting_table():
-    global _wasting
-    if _wasting is None:
-        _wasting = _load_wasting_lookup()
-    return _wasting
 
 
 def _nearest_day(sex: str, day: int, table: dict) -> tuple[float, float] | None:
@@ -148,7 +127,7 @@ def classify_stunting(sex: str, age_days: int, height_cm: float | None) -> tuple
     if height_cm is None or height_cm <= 0:
         return None, None
     sex = "M" if sex not in ("M", "F") else sex
-    table = _get_stunting_table()
+    table = _stunting_table_cached(str((PROCESSED_DIR / "stunting_lookup.csv").resolve()))
     row = _nearest_day(sex, age_days, table)
     if row is None:
         return None, None
@@ -169,7 +148,7 @@ def classify_underweight(sex: str, age_days: int, weight_kg: float | None) -> tu
     if weight_kg is None or weight_kg <= 0:
         return None, None
     sex = "M" if sex not in ("M", "F") else sex
-    table = _get_underweight_table()
+    table = _underweight_table_cached(str((PROCESSED_DIR / "underweight_lookup.csv").resolve()))
     row = _nearest_day(sex, age_days, table)
     if row is None:
         return None, None
@@ -196,7 +175,7 @@ def classify_wasting(
         return None, None, None
     sex = "M" if sex not in ("M", "F") else sex
     age_band = age_days_to_wasting_band(age_days)
-    table = _get_wasting_table()
+    table = _wasting_table_cached(str((PROCESSED_DIR / "wasting_lookup.csv").resolve()))
     row = _nearest_height(sex, age_band, height_cm, table)
     if row is None:
         return None, None, None

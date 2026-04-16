@@ -1,0 +1,9 @@
+table_row_limit: 10
+save_trace: true
+save_history: true
+queue_concurrency: 2
+queue_max_size: 32
+warmup_on_start: true
+server_name: "127.0.0.1"
+server_port: 7860
+share: false

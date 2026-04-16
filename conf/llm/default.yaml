@@ -1,0 +1,8 @@
+model: gpt-5-mini
+temperature: 0.0
+top_k: 5
+
+client:
+  _target_: langchain_openai.ChatOpenAI
+  model: ${..model}
+  temperature: ${..temperature}

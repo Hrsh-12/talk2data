@@ -11,6 +11,7 @@ Output: data/processed/stunting_lookup.csv, underweight_lookup.csv, wasting_look
 import csv
 import re
 from pathlib import Path
+from typing import Literal
 
 from PyPDF2 import PdfReader
 
@@ -25,44 +26,48 @@ def _extract_all_text(pdf_path: Path) -> str:
     )
 
 
-def parse_stunting_pdf(pdf_path: Path) -> list[dict]:
-    """Parse StuntedAssessmentParameters.pdf -> list of (sex, day, h_severe_max, h_normal_min)."""
+_STUNTING_UNDERWEIGHT_PATTERN = re.compile(
+    r"^(Girls|Boys)\s+(\d+-\d+)\s+years\s+(\d+)\s+([\d.]+)\s+[\d.]+\s+([\d.]+)\s+[\d.]+$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _parse_stunting_underweight_rows(
+    pdf_path: Path,
+    kind: Literal["stunting", "underweight"],
+) -> list[dict]:
+    """
+    Parse StuntedAssessmentParameters.pdf or UnderweightAssessmentParameters.pdf.
+
+    Both PDFs use the same line layout; only the threshold column names differ.
+    """
     text = _extract_all_text(pdf_path)
     rows = []
-    pattern = re.compile(
-        r"^(Girls|Boys)\s+(\d+-\d+)\s+years\s+(\d+)\s+([\d.]+)\s+[\d.]+\s+([\d.]+)\s+[\d.]+$",
-        re.MULTILINE | re.IGNORECASE,
-    )
-    for m in pattern.finditer(text):
+    for m in _STUNTING_UNDERWEIGHT_PATTERN.finditer(text):
         sex = "F" if m.group(1).lower() == "girls" else "M"
-        rows.append({
+        row = {
             "sex": sex,
             "age_group": m.group(2),
             "day": int(m.group(3)),
-            "h_severe_max": float(m.group(4)),
-            "h_normal_min": float(m.group(5)),
-        })
+        }
+        if kind == "stunting":
+            row["h_severe_max"] = float(m.group(4))
+            row["h_normal_min"] = float(m.group(5))
+        else:
+            row["w_severe_max"] = float(m.group(4))
+            row["w_normal_min"] = float(m.group(5))
+        rows.append(row)
     return rows
+
+
+def parse_stunting_pdf(pdf_path: Path) -> list[dict]:
+    """Parse StuntedAssessmentParameters.pdf -> list of (sex, day, h_severe_max, h_normal_min)."""
+    return _parse_stunting_underweight_rows(pdf_path, "stunting")
 
 
 def parse_underweight_pdf(pdf_path: Path) -> list[dict]:
     """Parse UnderweightAssessmentParameters.pdf -> list of (sex, day, w_severe_max, w_normal_min)."""
-    text = _extract_all_text(pdf_path)
-    rows = []
-    pattern = re.compile(
-        r"^(Girls|Boys)\s+(\d+-\d+)\s+years\s+(\d+)\s+([\d.]+)\s+[\d.]+\s+([\d.]+)\s+[\d.]+$",
-        re.MULTILINE | re.IGNORECASE,
-    )
-    for m in pattern.finditer(text):
-        sex = "F" if m.group(1).lower() == "girls" else "M"
-        rows.append({
-            "sex": sex,
-            "age_group": m.group(2),
-            "day": int(m.group(3)),
-            "w_severe_max": float(m.group(4)),
-            "w_normal_min": float(m.group(5)),
-        })
-    return rows
+    return _parse_stunting_underweight_rows(pdf_path, "underweight")
 
 
 def parse_wasting_pdf(pdf_path: Path) -> list[dict]:
@@ -89,7 +94,7 @@ def parse_wasting_pdf(pdf_path: Path) -> list[dict]:
     return rows
 
 
-def _write_csv(path: Path, rows: list[dict], fieldnames: list[str]):
+def _write_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -97,7 +102,7 @@ def _write_csv(path: Path, rows: list[dict], fieldnames: list[str]):
         w.writerows(rows)
 
 
-def main():
+def main() -> None:
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     stunting_pdf = DATA_DIR / "StuntedAssessmentParameters.pdf"
