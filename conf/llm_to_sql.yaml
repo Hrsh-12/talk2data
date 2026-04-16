@@ -5,6 +5,11 @@ defaults:
   - gradio: default
   - _self_
 
+# Pure-Hydra CLI inputs.
+# Provide either `question="..."` OR `queries_file="..."`.
+question: ""
+queries_file: null
+
 hydra:
   job:
     chdir: false

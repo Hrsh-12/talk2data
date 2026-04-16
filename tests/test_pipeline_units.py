@@ -16,8 +16,9 @@ REPO = Path(__file__).resolve().parents[1]
 from pipeline.benchmark.verification import (  # noqa: E402
     compare_generated_with_verified,
     compare_structured_values,
-    parse_verified_sql_by_query,
 )
+from pipeline.dataset_runtime import DatasetRuntime, duckdb_sqlalchemy_uri  # noqa: E402
+from pipeline.queries.catalog import parse_verified_sql_by_query  # noqa: E402
 from pipeline.db.engine import (  # noqa: E402
     execute_sql,
     extract_exec_items,
@@ -94,7 +95,14 @@ def test_run_query_dataframe_limit(tiny_duckdb: Path) -> None:
 
 def test_warmup_runtime_missing_db(tmp_path: Path) -> None:
     missing = tmp_path / "nope.duckdb"
-    warmup_runtime(db_path=missing, model="gpt-4o-mini", temperature=0.0)
+    warmup_runtime(
+        db_path=missing,
+        sqlalchemy_uri=duckdb_sqlalchemy_uri(missing),
+        schema_tables=("t",),
+        sample_sql=None,
+        model="gpt-4o-mini",
+        temperature=0.0,
+    )
 
 
 def test_parse_raw_output_none() -> None:
@@ -111,10 +119,29 @@ def test_extract_exec_items_single() -> None:
 def test_run_single_question_missing_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "dummy-not-called")
     missing = tmp_path / "missing.duckdb"
+    qp = tmp_path / "q.jsonl"
+    qp.write_text(
+        '{"question_id":1,"db_id":"t","question":"x","evidence":"NA","SQL":"SELECT 1;","difficulty":"NA"}\n',
+        encoding="utf-8",
+    )
+    rt = DatasetRuntime(
+        sqlalchemy_uri=duckdb_sqlalchemy_uri(missing),
+        db_path=missing,
+        queries_path=qp,
+        output_dir=tmp_path,
+        schema_tables=("t",),
+        sample_sql=None,
+        sql_generation_prompt_path=REPO / "conf/prompts/nutrition_sql.yaml",
+        sql_repair_prompt_path=REPO / "conf/prompts/nutrition_repair.yaml",
+        schema_notes_path=None,
+        hints_path=None,
+        db_id="t",
+        inject_evidence=False,
+    )
     with pytest.raises(FileNotFoundError, match="Database not found"):
         run_single_question(
             question="x",
-            db_path=missing,
+            runtime=rt,
             model="gpt-4o-mini",
             temperature=0.0,
             top_k=5,
@@ -141,7 +168,9 @@ def test_compare_generated_with_verified_empty_verified(tmp_path: Path) -> None:
     """Early return path — db_path is not opened."""
     dummy = tmp_path / "unused.duckdb"
     out = compare_generated_with_verified(
-        dummy,
+        duckdb_sqlalchemy_uri(dummy),
+        ["t"],
+        None,
         ["SELECT 1"],
         {"ok": True, "raw_output": "[(1,)]", "error": None},
         [],
@@ -153,7 +182,9 @@ def test_compare_generated_with_verified_failed_exec(tmp_path: Path) -> None:
     """Failed generated SQL — no verified execution against db_path."""
     dummy = tmp_path / "unused.duckdb"
     out = compare_generated_with_verified(
-        dummy,
+        duckdb_sqlalchemy_uri(dummy),
+        ["t"],
+        None,
         ["SELECT 1"],
         {"ok": False, "raw_output": None, "error": "boom"},
         ["SELECT 1;"],
@@ -177,15 +208,32 @@ def test_build_app_returns_blocks(tmp_path: Path, tiny_duckdb: Path) -> None:
         sys.path.insert(0, str(apps_dir))
     from gradio_app import build_app  # noqa: WPS433
 
-    verified = tmp_path / "v.sql"
-    verified.write_text("-- Q1: Example\nSELECT 1;\n", encoding="utf-8")
+    jsonl = tmp_path / "q.jsonl"
+    jsonl.write_text(
+        '{"question_id":1,"db_id":"t","question":"Example","evidence":"NA","SQL":"SELECT 1;","difficulty":"NA"}\n',
+        encoding="utf-8",
+    )
     out_dir = tmp_path / "traces"
     out_dir.mkdir()
     llm = MagicMock()
     llm.model_name = "gpt-4o-mini"
-    demo = build_app(
+    runtime = DatasetRuntime(
+        sqlalchemy_uri=duckdb_sqlalchemy_uri(tiny_duckdb),
         db_path=tiny_duckdb,
-        verified_sql_path=verified,
+        queries_path=jsonl,
+        output_dir=out_dir,
+        schema_tables=("t",),
+        sample_sql=None,
+        sql_generation_prompt_path=REPO / "conf/prompts/nutrition_sql.yaml",
+        sql_repair_prompt_path=REPO / "conf/prompts/nutrition_repair.yaml",
+        schema_notes_path=None,
+        hints_path=None,
+        db_id="t",
+        inject_evidence=False,
+    )
+    demo = build_app(
+        runtime=runtime,
+        queries_path=jsonl,
         output_dir=out_dir,
         llm=llm,
         merged_model="gpt-4o-mini",
@@ -201,6 +249,12 @@ def test_build_app_returns_blocks(tmp_path: Path, tiny_duckdb: Path) -> None:
             "max_retries": 1,
         },
         table_row_limit=10,
+        ui_title="T",
+        ui_subtitle="S",
+        tips_md="x",
+        sample_queries=["a"],
+        sample_query_labels=["L"],
+        ground_truth_db_id_filter=None,
     )
     assert isinstance(demo, gr.Blocks)
 

@@ -15,7 +15,7 @@ DEFAULT_QUERIES_TXT = QUERIES_DIR / "queries.txt"
 
 def resolve_config_path(path_str: str | Path, original_cwd: Path) -> Path:
     """Resolve a config path against ``get_original_cwd()`` when Hydra leaves cwd unchanged."""
-    p = Path(path_str)
+    p = Path(path_str).expanduser()
     if p.is_absolute():
         return p
     return (original_cwd / p).resolve()

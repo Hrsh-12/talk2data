@@ -1,4 +1,6 @@
-# Repo-relative paths; override with Hydra or set env vars (DB_PATH, VERIFIED_SQL_PATH, OUTPUT_DIR).
+# Legacy group — active defaults live in conf/dataset/*.yaml (see conf/config.yaml defaults).
+# Prefer setting DB_PATH, QUERIES_PATH, OUTPUT_DIR or Hydra `dataset=nutrition|bird`.
 db_path: ${oc.env:DB_PATH,database/nutrition_data.duckdb}
-verified_sql_path: ${oc.env:VERIFIED_SQL_PATH,'data/queries /queries_verified.sql'}
+queries_path: ${oc.env:QUERIES_PATH,data/nutrition_queries.jsonl}
+verified_sql_path: ${oc.env:VERIFIED_SQL_PATH,'data/queries/queries_verified.sql'}
 output_dir: ${oc.env:OUTPUT_DIR,outputs}

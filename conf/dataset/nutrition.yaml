@@ -1,0 +1,23 @@
+# @package _global_
+# Nutrition dataset defaults. Override with Hydra: `dataset=bird` or env: DB_PATH, QUERIES_PATH.
+paths:
+  db_path: ${oc.env:DB_PATH,database/nutrition_data.duckdb}
+  queries_path: ${oc.env:QUERIES_PATH,data/nutrition_queries.jsonl}
+  output_dir: ${oc.env:OUTPUT_DIR,outputs}
+
+dataset:
+  schema_tables:
+    - nutrition_data
+  db_id: up_child_nutrition
+  sample_sql: null
+  sql_generation_prompt_path: conf/prompts/nutrition_sql.yaml
+  sql_repair_prompt_path: conf/prompts/nutrition_repair.yaml
+  schema_notes_path: null
+  hints_path: null
+  inject_evidence: false
+  ui:
+    title: "Talk2Data"
+    subtitle: "UP Child Nutrition Analytics · 3.6 M records · Feb–Apr 2024"
+    tips_markdown: null
+    sample_queries: null
+    sample_query_labels: null

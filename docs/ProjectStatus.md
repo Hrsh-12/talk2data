@@ -1,276 +1,206 @@
-# ProjectStatus.md — Pipeline & Purpose
+# Project status — purpose and codebase guide
 
-## 1. Core Mission
-
-**Problem:** Uttar Pradesh's ICDS (Integrated Child Development Services) programme generates millions of child health records monthly, but field workers and programme managers lack the ability to query this data with natural language to extract actionable nutrition insights (prevalence of stunting, SAM, wasting trends, district-level comparisons, etc.).
-
-**Solution:** This project builds an end-to-end pipeline that:
-1. Ingests raw child health measurement records (~18.3M rows across 3 months).
-2. Classifies each child's nutritional status using WHO-standard anthropometric thresholds.
-3. Loads the labeled data into an embedded analytics database (DuckDB).
-4. Enables natural-language querying via LLM-generated SQL with a self-repair loop.
-5. Presents results through a Gradio chat UI with result rephrasing and tabular display.
-
-**Domain:** Public health nutrition analytics — specifically child malnutrition indicators (stunting, underweight, wasting, SAM/MAM) for children aged 0–6 years in Uttar Pradesh, India, over Feb–Apr 2024.
+This document summarizes **why the repo exists**, **how data and queries flow through it**, and **what is implemented today**. For file-level detail see [Codebase.md](Codebase.md); for test mapping see [TestSuite.md](TestSuite.md).
 
 ---
 
-## 2. The Pipeline
+## Purpose
 
-### 2.1 End-to-End Flow Diagram
+Uttar Pradesh ICDS child health data is large and tabular; this project turns labeled records into a **DuckDB** file and lets users ask **natural-language questions** that an LLM answers by generating **read-only SQL**, with optional repair on failure and a **Gradio** chat UI. The primary domain is **child nutrition** (stunting, underweight, wasting, SAM/MAM) for 0–6y, Feb–Apr 2024. The same NL→SQL machinery can target **other DuckDB datasets** via Hydra profiles (e.g. BIRD-style benchmarks).
+
+---
+
+## Assumptions
+
+The code is written around the following constraints. They are not universal truths about “any SQL database,” but **what this repository expects** so paths, configs, and tests stay coherent.
+
+**Language, packages, and config**
+
+- **Python 3** with the packages pinned in [`requirements.txt`](../requirements.txt) (no single pinned Python micro-version in-repo). Notable stack pieces: **Hydra** for composed YAML under `conf/`, **LangChain** for LLM + SQLDatabase wiring, **SQLAlchemy** (pinned below 2.x), **duckdb-engine**, **Gradio** for the UI.
+- **Hydra** loads `conf/config.yaml` with defaults `dataset`, `llm`, `rephrase`, `gradio`; `hydra.job.chdir` stays **false** so relative paths resolve from the process cwd as intended.
+- **Secrets** come from the environment (often a repo-root `.env` loaded by `python-dotenv` where scripts do so); **`OPENAI_API_KEY`** is required for any NL→SQL or rephrase call.
+
+**LLM**
+
+- The implementation uses **`langchain_openai.ChatOpenAI`** — an **OpenAI-compatible HTTP API** with the usual env-based key. Swapping to another provider means changing that wiring, not just env vars.
+
+**Database and SQL execution**
+
+- **DuckDB only** for the NL→SQL runtime: a **local file** (`.duckdb`) turned into a SQLAlchemy URI `duckdb:///<absolute path>` via `DatasetRuntime`. Other engines are out of scope unless you add drivers and URI handling.
+- **One active database per process**, selected at startup from the **`dataset`** Hydra profile plus optional **`DB_PATH`** / profile-specific env vars. The Gradio UI does **not** switch databases at runtime.
+- **Read-only execution path:** generated SQL is only run if it passes a lightweight check (`is_read_only_sql`): the trimmed statement must start with **`SELECT`** or **`WITH`**. This is a **heuristic**, not a full SQL parser; it blocks obvious `INSERT`/`UPDATE`/DDL but is not a security guarantee against malicious obfuscation.
+
+**Schema, prompts, and gold data**
+
+- **`dataset.schema_tables`** must name tables that **actually exist** in the DuckDB file; they drive LangChain schema introspection and sample rows.
+- **Prompts** live in **`conf/prompts/*.yaml`** with a top-level **`template`** string (and optional **`meta`**). Generation and repair use **separate YAML files** per profile when configured.
+- **Gold / benchmark queries** use **JSONL (or JSON)** with **BIRD-style fields** (`question_id`, `SQL`, `evidence`, …). A legacy **`-- Qn:`** annotated `.sql` file can still be loaded if configured.
+- **`inject_evidence`** on the dataset profile controls whether evidence strings are passed into the model for that catalog.
+
+**Primary nutrition domain**
+
+- The shipped ETL and prompts assume a **single wide table** (e.g. **`nutrition_data`**) in DuckDB, not the older multi-table normalized sketch documented only in historical notes.
+
+---
+
+## End-to-end flow
 
 ```mermaid
 flowchart TD
     A[WHO Assessment PDFs] --> B[parse_assessment_pdfs.py]
     B --> C[Lookup CSVs]
 
-    D[Raw ICDS CSV — 18.3M rows] --> E[Notebook EDA + Cleaning]
-    E --> F[cleaned_dataset.csv — 3.64M rows]
+    D[Raw ICDS CSV] --> E[Notebook EDA + Cleaning]
+    E --> F[cleaned_dataset.csv]
 
     C --> G[add_nutrition_labels.py]
     F --> G
-    G --> H[cleaned_dataset_with_labels.csv — 46 cols]
+    G --> H[cleaned_dataset_with_labels.csv]
 
     H --> I[build_nutrition_db.py]
     I --> J[(DuckDB — nutrition_data)]
 
-    J --> K[service.py]
+    J --> K[pipeline/service.py]
     L[OpenAI API] <--> K
-    K --> M[llm_to_sql.py — CLI]
-    K --> N[Gradio Chat UI]
-    M --> O[outputs/*.json — Traces]
-
-    O --> P[Validation — compare with verified SQL]
-    Q[queries_verified.sql — 28 benchmarks] --> P
+    K --> M[llm_to_sql.py]
+    K --> N[Gradio UI]
+    M --> O[outputs — traces]
+    O --> P[Validation vs gold SQL]
+    Q[data/nutrition_queries.jsonl] --> P
 ```
 
-### 2.2 Stage Details
+---
 
-#### Stage 0 — Reference Data Extraction
-- **Script:** `scripts/parse_assessment_pdfs.py`
-- **Input:** 3 WHO-style assessment parameter PDFs (not committed to repo)
-- **Process:** `PyPDF2` text extraction → regex parsing → CSV output
-- **Output:** `data/processed/stunting_lookup.csv`, `underweight_lookup.csv`, `wasting_lookup.csv`
-- **Idempotent:** Yes. Safe to re-run; overwrites existing CSVs.
+## Data pipeline (ETL)
 
-#### Stage 1 — Data Cleaning
-- **Tool:** `notebooks/01_initial_exploration.ipynb` (manual/interactive)
-- **Input:** Raw ICDS CSV (~18.3M rows, 2.3–2.9 GB)
-- **Process:** Chunked profiling (20k-row chunks), Hb column removal, null birth metrics filtering
-- **Output:** `data/cleaned_dataset.csv` (~3.64M rows, ~80% reduction)
-- **Status:** ⚠️ Not automated — requires manual notebook execution.
+| Step | Location | Role | Status |
+|------|----------|------|--------|
+| Reference thresholds from PDFs | `scripts/parse_assessment_pdfs.py` | Writes `data/processed/*_lookup.csv` | Implemented; idempotent |
+| Cleaning / filtering | `notebooks/01_initial_exploration.ipynb` | Produces `data/cleaned_dataset.csv` | **Notebook-only** (not a `scripts/` automation) |
+| WHO-style labels | `scripts/add_nutrition_labels.py` + `pipeline/nutrition_labels.py` | Chunked labeling; `classify_all()` | Implemented |
+| Build embedded DB | `scripts/build_nutrition_db.py` | CSV → DuckDB table (e.g. `nutrition_data`) | Implemented; memory-heavy for full CSV |
 
-#### Stage 2 — Nutrition Labeling
-- **Script:** `scripts/add_nutrition_labels.py`
-- **Input:** Cleaned CSV + lookup tables (from Stage 0)
-- **Process:** Streams in 50k-row chunks. For each row and each month (`feb24`, `mar24`, `apr24`), calls `classify_all()` from `pipeline/nutrition_labels.py`. Drops rows with zero height/weight.
-- **Output:** `data/cleaned_dataset_with_labels.csv` (~3.64M rows, 46 columns)
-- **Runtime:** Significant — row-by-row classification over 3.6M × 3 months.
-
-#### Stage 3 — Database Build
-- **Script:** `scripts/build_nutrition_db.py`
-- **Input:** Labeled CSV
-- **Process:** Full CSV → pandas DataFrame → normalize `*_is_*` columns to 0/1 → `CREATE OR REPLACE TABLE` in DuckDB
-- **Output:** `database/nutrition_data.duckdb`
-- **Note:** Loads entire CSV into memory. For the 3.6M-row dataset this requires ~4–8 GB RAM.
-
-#### Stage 4 — LLM-to-SQL Query
-- **Service:** `pipeline/service.py`
-- **Process:**
-  1. Cache schema introspection + 3 sample rows from DuckDB
-  2. Build grounded prompt with business rules and SQL patterns
-  3. Invoke `ChatOpenAI` (model: `gpt-5-mini`, temp: 0.0)
-  4. Extract SQL from LLM response (handles fenced/unfenced output)
-  5. Enforce read-only (SELECT/WITH only)
-  6. Execute via LangChain `SQLDatabase`
-  7. On failure: one repair attempt via second LLM call
-  8. Return structured result dict
-
-- **Interfaces:**
-  - **CLI:** `scripts/llm_to_sql.py` (single question or batch from file)
-  - **Web:** `apps/gradio_app.py` (Gradio chat with result rephrasing)
-
-#### Stage 5 — Validation
-- **Benchmark:** 28 curated questions in `data/queries/queries.txt`
-- **Golden SQL:** `data/queries/queries_verified.sql` with expected results in comments
-- **Comparison:** `compare_generated_with_verified()` performs structural + numeric diff with configurable tolerance
-- **Output:** Per-query verdicts (`right`/`wrong`/`not_checked`) in trace JSON
+The **runtime query path** does not re-run labeling; it only needs the built `.duckdb` file (and NL→SQL config).
 
 ---
 
-## 3. Current State
+## NL→SQL runtime and validation
 
-### 3.1 Functional (Production-Ready)
+**Query stack:** `pipeline/execution/runner.py` → `pipeline/llm/chains.py` (templates from `conf/prompts/*.yaml`) → `pipeline/db/engine.py` (LangChain `SQLDatabase`, execute, repair). Facade: `pipeline/service.py`.
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| `scripts/parse_assessment_pdfs.py` | ✅ Functional | Produces correct lookup CSVs; idempotent. |
-| `scripts/add_nutrition_labels.py` | ✅ Functional | Chunked streaming; handles edge cases (zero metrics, missing DOB). |
-| `pipeline/nutrition_labels.py` | ✅ Functional | Complete classification engine with nearest-neighbor interpolation for missing lookup keys. |
-| `scripts/build_nutrition_db.py` | ✅ Functional | Clean DuckDB build with bool normalization. |
-| `pipeline/service.py` | ✅ Functional | Full NL→SQL pipeline with repair loop and benchmarking support. |
-| `scripts/llm_to_sql.py` | ✅ Functional | CLI supports single and batch modes with trace output. |
-| `apps/gradio_app.py` | ✅ Functional | Chat UI with result tables, rephrasing, and ground-truth reference. |
-| `data/queries/queries_verified.sql` | ✅ Complete | 28 benchmark queries (Q1–Q28) with verified results. |
-| **Automated tests (`tests/`)** | ✅ In place | Pytest for SQL helpers, DuckDB execution, path resolution, benchmarks, Gradio `build_app`, result/rephrase helpers; optional `requires_db` checks. See §3.4. |
+**Configuration:** [`conf/config.yaml`](../conf/config.yaml) defaults to `dataset: nutrition`. [`conf/dataset/nutrition.yaml`](../conf/dataset/nutrition.yaml) sets `paths.db_path`, `paths.queries_path`, `dataset.schema_tables`, and YAML prompt paths. Switch profile with Hydra, e.g. `dataset=bird`, and env vars such as `DB_PATH`, `QUERIES_PATH`, or `BIRD_DB_PATH` / `BIRD_QUERIES_PATH` as documented in that profile. Dataset shape, DB engine, and prompt-file rules are summarized under **Assumptions** above.
 
-### 3.2 Work-in-Progress / Incomplete
-
-| Component | Status | Evidence |
-|-----------|--------|----------|
-| **Data cleaning automation** | 🔶 WIP | Cleaning is done in a notebook (`01_initial_exploration.ipynb`) with a `KeyboardInterrupt` in the saved labeling cell. No script equivalent for the cleaning step exists. |
-| **Normalized DB schema** | 🔶 Abandoned | `docs/PROJECT.md` describes a multi-table design (`beneficiaries`, `monthly_measurements`, lookup tables). `notebooks/01_explore.ipynb` validates a `child_health.duckdb` with this schema. The current pipeline only builds the flat `nutrition_data` table. |
-| **`prefer_verified_templates` routing** | 🔶 Disabled | Parameter exists in `run_single_question()` signature but is a documented no-op (`_ = prefer_verified_templates`). Template routing was removed. |
-| **`district_mapping.csv` integration** | 🔶 Unused in code | File exists but no script or service code imports or joins it. Some verified SQL references `district_name` which would require this mapping. |
-
-### 3.3 Gaps and Missing Pieces
-
-| Gap | Impact | Recommendation |
-|-----|--------|----------------|
-| **No CI/CD** | High — no automated quality gates. | Add GitHub Actions (or similar) to run `PYTHONPATH=. pytest tests/ -m "not requires_db"` on each push; optionally add a job with a small fixture DuckDB for `requires_db`. |
-| **No containerization** | Medium — environment reproducibility risk. | Add a `Dockerfile` and `docker-compose.yml` for the Gradio app + DuckDB. |
-| **No structured logging** | Medium — debugging is limited to `print()`. | Adopt Python `logging` with structured output. |
-| **No data validation** | Medium — schema drift is undetected. | Add a validation step (e.g., Great Expectations or a simple assertion script) between labeling and DB build. |
-| **No error monitoring** | Low — LLM failures are swallowed silently. | Add error tracking (Sentry, or at minimum file-based error logs). |
-| **Space in `data/queries /` dirname** | Low — fragile. | Rename to `data/queries/` (no trailing space). |
-
-### 3.4 Automated testing
-
-| Item | Detail |
-|------|--------|
-| **Layout** | `tests/test_nutrition_sql_pure.py` — `extract_sql`, `normalize_sql`, benchmark parsing/comparison. `tests/test_pipeline_units.py` — read-only SQL checks, temp DuckDB, `resolve_config_path`, runner preflight, Gradio build smoke, result helpers (mocks where needed). `tests/test_connectivity_inference.py` — optional DuckDB file checks (`RUN_CONNECTIVITY=1`, marker `requires_db`). `tests/conftest.py` — skips connectivity tests unless opted in. |
-| **Docs** | Catalog and test IDs: [TestSuite.md](TestSuite.md). |
-| **Run** | From repo root: `PYTHONPATH=. python -m pytest tests/` (see [README.md](../README.md) for `-m "not requires_db"` and connectivity). |
-| **Not covered in CI by default** | Live OpenAI, full NL→SQL end-to-end, and Hydra `compose` are not exercised in the current test set (Hydra-only tests were removed; app config is still loaded at runtime via `@hydra.main` / `compose` in scripts). |
+**Validation:** Batch CLI compares generated SQL execution to gold SQL via `compare_generated_with_verified()`; line order in `data/queries/queries.txt` aligns with `question_id` in the catalog. Traces land under `outputs/`.
 
 ---
 
-## 4. Execution Flow — "How It Runs"
+## What exists in the repository
 
-### 4.1 First-Time Setup
+| Area | Contents | Status |
+|------|----------|--------|
+| **`scripts/`** | PDF parse, labeling, DB build, `llm_to_sql.py` | All four entry points are implemented CLI tools |
+| **`pipeline/`** | `nutrition_labels`, `dataset_runtime`, `queries/catalog`, `db/engine`, `llm/` (chains + prompt loader), `execution/`, `benchmark/verification`, `service` | Core library for NL→SQL; used by apps and scripts |
+| **`apps/`** | `gradio_app.py`, `result_utils.py`, `ui_content.py`, `config.py` | Gradio UI, formatting, rephrase helpers |
+| **`conf/`** | `config.yaml`, `dataset/*.yaml`, `llm`, `rephrase`, `gradio`, `prompts/*.yaml` | Hydra defaults; dataset-specific paths and prompts |
+| **`data/`** | CSVs, lookups, `nutrition_queries.jsonl`, legacy `queries/queries_verified.sql` | Assets often gitignored locally; JSONL is the preferred gold-SQL catalog |
+| **`database/`** | Built `.duckdb` (often gitignored) | Output of `build_nutrition_db.py` |
+| **`tests/`** | Pure helpers, temp DuckDB, Gradio smoke, optional `requires_db` | `PYTHONPATH=. pytest tests/`; see TestSuite.md |
+| **`docs/`** | Codebase.md, this file, TestSuite.md | Architecture and test catalog |
+| **`notebooks/`** | EDA and exploration | Not part of automated pipeline |
+
+**Historical / unused in the query path:** `docs/PROJECT.md` described a normalized multi-table schema; the shipped pipeline uses a **single wide** `nutrition_data` table. `district_mapping.csv` exists under `data/` but is not wired into scripts or the NL→SQL layer. A `prefer_verified_templates` parameter on `run_single_question` remains as a **no-op** for backward compatibility.
+
+---
+
+## Tests
+
+Pytest covers SQL text helpers, read-only guards, small DuckDB fixtures, path resolution, catalog parsing, benchmark comparison helpers, Gradio `build_app` smoke (mocked LLM), and result/rephrase utilities. Optional connectivity tests against a real DuckDB file use `RUN_CONNECTIVITY=1` and the `requires_db` marker. Details: [TestSuite.md](TestSuite.md).
+
+---
+
+## How to run
+
+### Setup
 
 ```bash
-# 1. Environment
-conda activate eda                          # or: python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# 2. Create .env with API key (required for LLM CLI / Gradio)
-echo "OPENAI_API_KEY=sk-..." > .env
-
-# 3. (Optional) Run tests — see README.md
-# PYTHONPATH=. python -m pytest tests/
-
-# 4. Place source PDFs in data/ (if lookup CSVs don't exist yet)
-#    StuntedAssessmentParameters.pdf
-#    UnderweightAssessmentParameters.pdf
-#    WastedAssessmentParameters.pdf
-
-# 5. Place cleaned_dataset.csv in data/ (produced via notebook or external process)
+# .env at repo root: OPENAI_API_KEY=...
 ```
 
-### 4.2 Pipeline Execution (Sequential)
+### Typical commands
 
 ```bash
-# Stage 0: Parse PDFs → lookup CSVs (skip if data/processed/*.csv already exist)
+# ETL (when assets are present)
 python scripts/parse_assessment_pdfs.py
+python scripts/add_nutrition_labels.py --input data/cleaned_dataset.csv --output data/cleaned_dataset_with_labels.csv
+python scripts/build_nutrition_db.py --csv data/cleaned_dataset_with_labels.csv --db database/nutrition_data.duckdb
 
-# Stage 2: Label the cleaned dataset
-python scripts/add_nutrition_labels.py \
-  --input data/cleaned_dataset.csv \
-  --output data/cleaned_dataset_with_labels.csv
+# NL→SQL
+python scripts/llm_to_sql.py "Your question?"
+python scripts/llm_to_sql.py --queries-file "data/queries/queries.txt" --output-dir outputs
 
-# Stage 3: Build DuckDB
-python scripts/build_nutrition_db.py \
-  --csv data/cleaned_dataset_with_labels.csv \
-  --db database/nutrition_data.duckdb
-
-# Stage 4a: CLI query (single)
-python scripts/llm_to_sql.py "What is the SAM prevalence in March 2024?"
-
-# Stage 4b: CLI query (batch with verification)
-python scripts/llm_to_sql.py \
-  --queries-file "data/queries /queries.txt" \
-  --output-dir outputs
-
-# Stage 5: Launch Gradio UI
+# Web UI
 python apps/gradio_app.py
 ```
 
-### 4.3 Entry Points Summary
+### Entry points
 
-| Entry Point | Type | Command |
-|-------------|------|---------|
-| `scripts/parse_assessment_pdfs.py` | CLI (no args) | `python scripts/parse_assessment_pdfs.py` |
-| `scripts/add_nutrition_labels.py` | CLI (argparse) | `python scripts/add_nutrition_labels.py [--input] [--output] [--chunksize]` |
-| `scripts/build_nutrition_db.py` | CLI (argparse) | `python scripts/build_nutrition_db.py [--csv] [--db] [--table]` |
-| `scripts/llm_to_sql.py` | CLI (argparse) | `python scripts/llm_to_sql.py "question"` or `--queries-file` |
-| `apps/gradio_app.py` | Web server | `python apps/gradio_app.py` → `http://127.0.0.1:7860` |
+| Script / app | Command |
+|--------------|---------|
+| `parse_assessment_pdfs.py` | `python scripts/parse_assessment_pdfs.py` |
+| `add_nutrition_labels.py` | `python scripts/add_nutrition_labels.py` (see `--help`) |
+| `build_nutrition_db.py` | `python scripts/build_nutrition_db.py` (see `--help`) |
+| `llm_to_sql.py` | `python scripts/llm_to_sql.py` … or Hydra overrides after args |
+| `gradio_app.py` | `python apps/gradio_app.py` → default http://127.0.0.1:7860 |
 
-### 4.4 Environment Variables
+### Environment variables (common)
 
-| Variable | Default | Used By |
-|----------|---------|---------|
-| `OPENAI_API_KEY` | *(required)* | `service.py`, transitive to all LLM calls |
-| `DB_PATH` | `database/nutrition_data.duckdb` | `gradio_app.py` |
-| `MODEL_NAME` | `gpt-5-mini` | `gradio_app.py` |
-| `REPHRASE_MODEL_NAME` | `gpt-4o-mini` | `gradio_app.py` |
-| `TOP_K` | `5` | `gradio_app.py` |
-| `TEMPERATURE` | `0.0` | `gradio_app.py` |
-| `GRADIO_SERVER_NAME` | `127.0.0.1` | `gradio_app.py` |
-| `GRADIO_SERVER_PORT` | `7860` | `gradio_app.py` |
-| `GRADIO_SHARE` | `false` | `gradio_app.py` |
-| `SAVE_TRACE` | `true` | `gradio_app.py` |
-| `WARMUP_ON_START` | `true` | `gradio_app.py` |
-| `GRADIO_QUEUE_CONCURRENCY` | `2` | `gradio_app.py` |
-| `GRADIO_QUEUE_MAX_SIZE` | `32` | `gradio_app.py` |
-| `GRADIO_SAVE_HISTORY` | `true` | `gradio_app.py` |
+| Variable | Role |
+|----------|------|
+| `OPENAI_API_KEY` | Required for any LLM call |
+| `DB_PATH` | Overrides default DuckDB path from dataset config |
+| `QUERIES_PATH` | Gold query catalog JSONL |
+| `MODEL_NAME`, `TEMPERATURE`, `TOP_K` | LLM overrides for CLI/UI |
+| `GRADIO_SERVER_NAME`, `GRADIO_SERVER_PORT`, `GRADIO_SHARE` | Gradio server |
+| `BIRD_DB_PATH`, `BIRD_QUERIES_PATH` | Used when `dataset=bird` (see `conf/dataset/bird.yaml`) |
 
-### 4.5 Runtime Architecture
+### Runtime sequence (Gradio / single question)
 
 ```mermaid
 flowchart TD
-    A[User enters question] --> B[Gradio UI]
-    B --> C[service.py — run_single_question]
-    C --> D[Build prompt from cached schema + sample rows]
-    D --> E[OpenAI API — generate SQL]
-    E --> F[Extract SQL from LLM response]
-    F --> G[Read-only check]
-    G --> H[Execute SQL on DuckDB]
-    H --> I{Success?}
-    I -- Yes --> K[Return result]
-    I -- No --> J[OpenAI API — repair SQL]
-    J --> H
-    K --> L[Rephrase result via LLM]
-    L --> M[Gradio UI — chat reply + table + summary]
-    M --> N[User sees answer]
+    A[User question] --> B[Gradio]
+    B --> C[run_single_question]
+    C --> D[Prompt from YAML + schema cache]
+    D --> E[OpenAI — SQL]
+    E --> F[Execute on DuckDB]
+    F --> G{OK?}
+    G -- No --> H[Repair SQL]
+    H --> F
+    G -- Yes --> I[Rephrase optional]
+    I --> J[Reply + table]
 ```
 
 ---
 
-## 5. File Inventory
+## Repository layout (quick reference)
 
-| Directory | Tracked files (representative) | Gitignored content | Role |
-|-----------|-------------------------------|-------------------|------|
-| `apps/` | `gradio_app.py`, `config.py`, `result_utils.py`, `ui_content.py` | — | Gradio UI and helpers |
-| `scripts/` | 4 × `*.py` (parse, label, build DB, `llm_to_sql`) | — | ETL + CLI query |
-| `pipeline/` | Library modules (`service`, `db`, `llm`, `execution`, …) | — | NL→SQL + shared logic |
-| `conf/` | Hydra YAML (`config.yaml`, `paths`, `llm`, `rephrase`, `gradio`) | — | Defaults for app/CLI |
-| `tests/` | `test_nutrition_sql_pure.py`, `test_pipeline_units.py`, `test_connectivity_inference.py`, `conftest.py` | — | Pytest |
-| Root | `README.md`, `requirements.txt`, `pytest.ini`, `.gitignore`, … | `.env` | Docs + tooling |
-| `data/` | Often empty in git | CSVs, PDFs, queries | Data assets |
-| `database/` | `.gitkeep` | `*.duckdb` | Built analytics DB |
-| `notebooks/` | 3 | — | EDA |
-| `docs/` | `Codebase.md`, `ProjectStatus.md`, `TestSuite.md` | — | Documentation |
-| `outputs/` | — | `*.json` traces | LLM traces |
+| Path | Role |
+|------|------|
+| `apps/` | Gradio UI and display helpers |
+| `scripts/` | ETL and CLI query |
+| `pipeline/` | Shared NL→SQL and nutrition labeling library |
+| `conf/` | Hydra config and YAML prompts |
+| `data/` | Inputs and query catalogs |
+| `database/` | Built DuckDB (artifact) |
+| `tests/` | Pytest |
+| `docs/` | Documentation |
+| `outputs/` | Batch traces (artifact) |
+| `notebooks/` | Exploration |
 
+---
 
+## Related reading
 
-
-## TODO(Suggestions) 
-1. Selective Patch from the DB ( Avoid Select * type statements)
-2. Add Logging for the Codebase (INFO, ERROR, CRITICAL levels)
-  Ex: LLM Generated Query, SQL Results in INFO 
-3. Need Sample Queries - Query, SQL, Natural Language Answer (Tonality, Formatting). [>50]
-
-
-
+- [Codebase.md](Codebase.md) — structural design and component map  
+- [README.md](../README.md) — quick start and env hints  
+- [TestSuite.md](TestSuite.md) — automated test catalog  

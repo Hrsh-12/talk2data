@@ -15,7 +15,11 @@ REPO = Path(__file__).resolve().parents[1]
 def _default_db_path() -> Path:
     raw = os.environ.get("DB_PATH")
     if raw:
-        return Path(raw) if Path(raw).is_absolute() else REPO / raw
+        p = Path(raw).expanduser()
+        return p if p.is_absolute() else (REPO / raw).resolve()
+    home_data = Path.home() / "data" / "nutrition_data.duckdb"
+    if home_data.exists():
+        return home_data
     return REPO / "database" / "nutrition_data.duckdb"
 
 

@@ -13,22 +13,36 @@ from langchain_openai import ChatOpenAI
 from pipeline.sql.text import is_read_only_sql
 
 
-def prepare_db_context(db_path: Path) -> tuple[SQLDatabase, str, str]:
+def prepare_db_context(
+    sqlalchemy_uri: str,
+    schema_tables: list[str] | tuple[str, ...],
+    sample_sql: str | None = None,
+) -> tuple[SQLDatabase, str, str]:
     """Open the DB, return LangChain wrapper plus table info and escaped sample rows for prompts."""
-    db = SQLDatabase.from_uri(f"duckdb:///{db_path}")
-    table_info = db.get_table_info(["nutrition_data"])
-    sample_rows_text = db.run("SELECT * FROM nutrition_data LIMIT 3")
-    # Brace-escape so str.format / f-strings in prompts do not treat JSON-like cells as fields.
-    sample_rows_text = str(sample_rows_text).replace("{", "{{").replace("}", "}}")
+    st = tuple(schema_tables)
+    override = sample_sql or ""
+    table_info, sample_rows_text = cached_prompt_context(sqlalchemy_uri, st, override)
+    db = SQLDatabase.from_uri(sqlalchemy_uri)
     return db, table_info, sample_rows_text
 
 
-@lru_cache(maxsize=4)
-def cached_prompt_context(db_path_str: str) -> tuple[str, str]:
-    """Cached (table_info, sample_rows_text) for prompt building; avoids reopening DB each query."""
-    db = SQLDatabase.from_uri(f"duckdb:///{db_path_str}")
-    table_info = db.get_table_info(["nutrition_data"])
-    sample_rows_text = db.run("SELECT * FROM nutrition_data LIMIT 3")
+@lru_cache(maxsize=32)
+def cached_prompt_context(
+    sqlalchemy_uri: str,
+    schema_tables: tuple[str, ...],
+    sample_sql_override: str,
+) -> tuple[str, str]:
+    """Cached (table_info, sample_rows_text) for prompt building."""
+    db = SQLDatabase.from_uri(sqlalchemy_uri)
+    table_list = list(schema_tables)
+    if not table_list:
+        raise ValueError("schema_tables must not be empty")
+    table_info = db.get_table_info(table_list)
+    if sample_sql_override.strip():
+        run_sql = sample_sql_override.strip()
+    else:
+        run_sql = f"SELECT * FROM {table_list[0]} LIMIT 3"
+    sample_rows_text = db.run(run_sql)
     sample_rows_text = str(sample_rows_text).replace("{", "{{").replace("}", "}}")
     return table_info, sample_rows_text
 
@@ -38,11 +52,18 @@ def cached_llm(model: str, temperature: float) -> ChatOpenAI:
     return ChatOpenAI(model=model, temperature=temperature)
 
 
-def warmup_runtime(db_path: Path, model: str, temperature: float) -> None:
+def warmup_runtime(
+    db_path: Path,
+    sqlalchemy_uri: str,
+    schema_tables: tuple[str, ...],
+    sample_sql: str | None,
+    model: str,
+    temperature: float,
+) -> None:
     """Prime cached schema/sample context and LLM client to reduce first-query latency."""
     if not db_path.exists():
         return
-    cached_prompt_context(str(db_path.resolve()))
+    cached_prompt_context(sqlalchemy_uri, schema_tables, sample_sql or "")
     cached_llm(model=model, temperature=temperature)
 
 

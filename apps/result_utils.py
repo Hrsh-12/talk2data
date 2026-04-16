@@ -13,6 +13,9 @@ from pathlib import Path
 
 import duckdb
 import pandas as pd
+from sqlalchemy import create_engine, text
+
+from pipeline.dataset_runtime import duckdb_sqlalchemy_uri
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -141,7 +144,7 @@ def _format_ground_truth_answer(answer_text: str, max_items: int = 5) -> str:
     return f"<strong>{_escape_html(_format_scalar(parsed))}</strong>"
 
 
-def _load_ground_truth_rows(path: Path) -> list[tuple[str, str]]:
+def _load_ground_truth_rows_legacy_sql(path: Path) -> list[tuple[str, str]]:
     if not path.exists():
         return [("N/A", f"Verified file not found: {path}")]
 
@@ -177,30 +180,98 @@ def _load_ground_truth_rows(path: Path) -> list[tuple[str, str]]:
     return rows
 
 
-def ground_truth_html(path: Path) -> str:
-    """Scrollable HTML table for the ground truth panel."""
-    rows = _load_ground_truth_rows(path)
-    table_rows = "".join(
-        "<tr>"
-        f"<td class='gt-query'>{_escape_html(query)}</td>"
-        f"<td class='gt-answer'>{_format_ground_truth_answer(answer)}</td>"
-        "</tr>"
-        for query, answer in rows
-    )
+def _format_evidence_cell(evidence: object) -> str:
+    s = str(evidence).strip() if evidence is not None else ""
+    if not s or s.upper() in ("NA", "N/A"):
+        return "<em>—</em>"
+    return _escape_html(s)
+
+
+def ground_truth_html(path: Path, *, db_id_filter: str | None = None) -> str:
+    """Scrollable HTML table: BIRD-style JSONL/JSON or legacy `-- Qn:` SQL file."""
+    if not path.exists():
+        return (
+            "<p><em>Query catalog not found: "
+            f"{_escape_html(str(path))}</em></p>"
+        )
+
+    suffix = path.suffix.lower()
+    if suffix == ".sql":
+        rows = _load_ground_truth_rows_legacy_sql(path)
+        table_rows = "".join(
+            "<tr>"
+            f"<td class='gt-query'>{_escape_html(query)}</td>"
+            f"<td class='gt-answer'>{_format_ground_truth_answer(answer)}</td>"
+            "</tr>"
+            for query, answer in rows
+        )
+        return (
+            "<style>"
+            ".gt-wrap{overflow-x:auto;overflow-y:auto;max-height:480px}"
+            ".gt-tbl{width:100%;border-collapse:collapse;table-layout:fixed;font-size:12px}"
+            ".gt-tbl th,.gt-tbl td{border:1px solid #dbeafe;padding:7px 9px;vertical-align:top;text-align:left}"
+            ".gt-tbl thead th{background:#eff6ff;font-weight:600;color:#1d4ed8;position:sticky;top:0;z-index:1}"
+            ".gt-tbl .gt-query{width:40%;word-break:break-word;color:#374151}"
+            ".gt-tbl .gt-answer{width:60%;word-break:break-word;line-height:1.45;color:#374151}"
+            ".gt-tbl .gt-answer code{white-space:pre-wrap;word-break:break-word;font-size:11px}"
+            ".gt-tbl tr:nth-child(even) td{background:#f8faff}"
+            "</style>"
+            "<div class='gt-wrap'>"
+            "<table class='gt-tbl'>"
+            "<thead><tr><th class='gt-query'>Query</th><th class='gt-answer'>Ground Truth</th></tr></thead>"
+            f"<tbody>{table_rows}</tbody>"
+            "</table></div>"
+        )
+
+    from pipeline.queries.catalog import load_query_catalog
+
+    catalog = load_query_catalog(path)
+    if db_id_filter:
+        catalog = [r for r in catalog if str(r.get("db_id", "")) == db_id_filter]
+
+    table_rows = ""
+    for row in catalog:
+        qid = row.get("question_id", "")
+        qtext = str(row.get("question", ""))
+        label = f"Q{qid}: {qtext}" if qtext else f"Q{qid}"
+        ev = _format_evidence_cell(row.get("evidence"))
+        sql_text = str(row.get("SQL") or row.get("sql") or "")
+        sql_html = f"<code>{_escape_html(sql_text)}</code>" if sql_text else "—"
+        diff = str(row.get("difficulty", "") or "")
+        if diff.upper() in ("NA", "N/A", ""):
+            diff_html = "<em>—</em>"
+        else:
+            diff_html = _escape_html(diff)
+        table_rows += (
+            "<tr>"
+            f"<td class='gt-query'>{_escape_html(label)}</td>"
+            f"<td class='gt-evidence'>{ev}</td>"
+            f"<td class='gt-sql'>{sql_html}</td>"
+            f"<td class='gt-diff'>{diff_html}</td>"
+            "</tr>"
+        )
+
     return (
         "<style>"
         ".gt-wrap{overflow-x:auto;overflow-y:auto;max-height:480px}"
         ".gt-tbl{width:100%;border-collapse:collapse;table-layout:fixed;font-size:12px}"
         ".gt-tbl th,.gt-tbl td{border:1px solid #dbeafe;padding:7px 9px;vertical-align:top;text-align:left}"
         ".gt-tbl thead th{background:#eff6ff;font-weight:600;color:#1d4ed8;position:sticky;top:0;z-index:1}"
-        ".gt-tbl .gt-query{width:40%;word-break:break-word;color:#374151}"
-        ".gt-tbl .gt-answer{width:60%;word-break:break-word;line-height:1.45;color:#374151}"
-        ".gt-tbl .gt-answer code{white-space:pre-wrap;word-break:break-word;font-size:11px}"
+        ".gt-tbl .gt-query{width:22%;word-break:break-word;color:#374151}"
+        ".gt-tbl .gt-evidence{width:28%;word-break:break-word;color:#374151}"
+        ".gt-tbl .gt-sql{width:40%;word-break:break-word;color:#374151}"
+        ".gt-tbl .gt-diff{width:10%;color:#374151}"
+        ".gt-tbl .gt-sql code{white-space:pre-wrap;word-break:break-word;font-size:11px}"
         ".gt-tbl tr:nth-child(even) td{background:#f8faff}"
         "</style>"
         "<div class='gt-wrap'>"
         "<table class='gt-tbl'>"
-        "<thead><tr><th class='gt-query'>Query</th><th class='gt-answer'>Ground Truth</th></tr></thead>"
+        "<thead><tr>"
+        "<th class='gt-query'>Query</th>"
+        "<th class='gt-evidence'>Evidence</th>"
+        "<th class='gt-sql'>Gold SQL</th>"
+        "<th class='gt-diff'>Difficulty</th>"
+        "</tr></thead>"
         f"<tbody>{table_rows}</tbody>"
         "</table></div>"
     )
@@ -221,14 +292,20 @@ def _parse_exec_output(raw_output: object) -> tuple[str, object]:
         return text, text
 
 
-def _columns_for_sql(db_path: Path, sql: str) -> list[str] | None:
+def _columns_for_sql(engine_target: Path | str, sql: str) -> list[str] | None:
     cleaned = sql.strip()
     if not cleaned or not is_read_only_sql(cleaned):
         return None
     wrapped = f"SELECT * FROM ({cleaned.rstrip(';')}) AS q LIMIT 0;"
     try:
-        with duckdb.connect(str(db_path)) as conn:
-            df0 = conn.execute(wrapped).fetchdf()
+        if isinstance(engine_target, Path):
+            with duckdb.connect(str(engine_target)) as conn:
+                df0 = conn.execute(wrapped).fetchdf()
+            return [str(c) for c in df0.columns]
+        uri = engine_target
+        engine = create_engine(uri)
+        with engine.connect() as conn:
+            df0 = pd.read_sql(text(wrapped), conn)
         return [str(c) for c in df0.columns]
     except Exception:
         return None
@@ -241,14 +318,17 @@ def build_result_table(
     executed_sql: str,
     exec_payload: dict,
     max_rows: int,
+    sqlalchemy_uri: str | None = None,
     db_path: Path | None = None,
 ) -> tuple[pd.DataFrame, str]:
     """
     Convert already-executed SQL output into a display DataFrame + summary markdown.
     Uses a LIMIT 0 probe to recover column names when needed.
     """
-    if db_path is None:
-        db_path = _default_db_path()
+    if sqlalchemy_uri is None and db_path is not None:
+        sqlalchemy_uri = duckdb_sqlalchemy_uri(db_path)
+    if sqlalchemy_uri is None:
+        sqlalchemy_uri = duckdb_sqlalchemy_uri(_default_db_path())
     safe_limit = max(1, int(max_rows))
 
     if not exec_payload.get("ok"):
@@ -268,7 +348,7 @@ def build_result_table(
         shown = parsed[:safe_limit]
         col_count = max(len(r) for r in shown)
         normalized = [list(r) + [None] * (col_count - len(r)) for r in shown]
-        cols = _columns_for_sql(db_path, executed_sql) if executed_sql else None
+        cols = _columns_for_sql(sqlalchemy_uri, executed_sql) if executed_sql else None
         df = pd.DataFrame(
             normalized,
             columns=cols if cols and len(cols) == col_count else [f"col_{i}" for i in range(1, col_count + 1)],

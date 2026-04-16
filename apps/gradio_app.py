@@ -2,8 +2,7 @@
 """
 gradio_app.py — Gradio UI entry point.
 
-Wires together Hydra config, result_utils, and the nutrition SQL service into a
-chat interface with a toggleable side panel.
+Wires together Hydra config, dataset runtime, result_utils, and the NL→SQL service.
 """
 from __future__ import annotations
 
@@ -26,9 +25,11 @@ import gradio as gr
 import hydra
 import pandas as pd
 from hydra.utils import get_original_cwd, instantiate
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
+from pipeline.dataset_runtime import DatasetRuntime
 from pipeline.paths import resolve_config_path
+from pipeline.queries.catalog import load_query_catalog
 from pipeline.service import run_single_question, save_single_trace, warmup_runtime
 
 from ui_content import (  # noqa: E402
@@ -70,10 +71,43 @@ def _rephrase_kwargs(cfg: DictConfig) -> dict:
     }
 
 
+def _ui_samples(cfg: DictConfig, queries_path: Path) -> tuple[list[str], list[str]]:
+    ds_ui = OmegaConf.select(cfg, "dataset.ui", default=None) or {}
+    sq = OmegaConf.select(ds_ui, "sample_queries", default=None)
+    if sq:
+        labels = OmegaConf.select(ds_ui, "sample_query_labels", default=None)
+        qs = [str(x) for x in sq]
+        if labels:
+            lab = [str(x) for x in labels]
+        else:
+            lab = [f"Example {i + 1}" for i in range(len(qs))]
+        return qs, lab
+    try:
+        cat = load_query_catalog(queries_path)
+        qs = [str(r["question"]) for r in cat[:8] if r.get("question")]
+        lab = [f"Q{r.get('question_id', i)}" for i, r in enumerate(cat[: len(qs)])]
+        if qs:
+            return qs, lab
+    except Exception:
+        pass
+    return list(SAMPLE_QUERIES), list(SAMPLE_QUERY_LABELS)
+
+
+def _tips_markdown(cfg: DictConfig, orig: Path) -> str:
+    ds_ui = OmegaConf.select(cfg, "dataset.ui", default=None) or {}
+    raw = OmegaConf.select(ds_ui, "tips_markdown", default=None)
+    if not raw:
+        return TIPS_MD
+    p = resolve_config_path(raw, orig).expanduser()
+    if p.exists():
+        return p.read_text(encoding="utf-8")
+    return TIPS_MD
+
+
 def build_app(
     *,
-    db_path: Path,
-    verified_sql_path: Path,
+    runtime: DatasetRuntime,
+    queries_path: Path,
     output_dir: Path,
     llm,
     merged_model: str,
@@ -83,6 +117,12 @@ def build_app(
     save_history: bool,
     rephrase_kw: dict,
     table_row_limit: int,
+    ui_title: str,
+    ui_subtitle: str,
+    tips_md: str,
+    sample_queries: list[str],
+    sample_query_labels: list[str],
+    ground_truth_db_id_filter: str | None,
 ) -> gr.Blocks:
     def chat_handler(message: str, history: list[dict]):
         _ = history
@@ -92,11 +132,10 @@ def build_app(
         try:
             result = run_single_question(
                 question=message,
-                db_path=db_path,
+                runtime=runtime,
                 model=merged_model,
                 temperature=merged_temp,
                 top_k=merged_top_k,
-                prefer_verified_templates=True,
                 llm=llm,
             )
         except Exception as exc:
@@ -106,7 +145,7 @@ def build_app(
         sql_list = result.get("generated_sql_list", [result.get("generated_sql", "")])
 
         if save_trace:
-            save_single_trace(output_dir, db_path, result)
+            save_single_trace(output_dir, runtime.db_path, result)
 
         exec_payload = result.get("sql_execution", {})
         reply_text = rephrase_reply(
@@ -118,7 +157,7 @@ def build_app(
             executed_sql=str(sql_list[0] if sql_list else ""),
             exec_payload=exec_payload,
             max_rows=table_row_limit,
-            db_path=db_path,
+            sqlalchemy_uri=runtime.sqlalchemy_uri,
         )
 
         is_error = not table_df.empty and table_df.shape[1] == 1 and str(table_df.columns[0]).lower() == "error"
@@ -128,7 +167,8 @@ def build_app(
             preview_md = _df_to_markdown_table(table_df.head(5))
             suffix = (
                 f"\n\n_Showing first 5 of {n_total} rows — see **Results** panel for the full table._"
-                if n_total > 5 else ""
+                if n_total > 5
+                else ""
             )
             reply = f"{reply_text}\n\n{preview_md}{suffix}"
         else:
@@ -141,19 +181,21 @@ def build_app(
         secondary_hue=gr.themes.colors.indigo,
         neutral_hue=gr.themes.colors.slate,
     )
-    gt_html = ground_truth_html(verified_sql_path)
-    sample_md = "\n".join(f"{i}. {q}" for i, q in enumerate(SAMPLE_QUERIES, 1))
+    gt_html = ground_truth_html(queries_path, db_id_filter=ground_truth_db_id_filter)
+    sample_md = "\n".join(f"{i}. {q}" for i, q in enumerate(sample_queries, 1))
 
-    with gr.Blocks(title="Talk2Data", theme=_theme, css=APP_CSS, fill_height=True) as demo:
+    with gr.Blocks(title=ui_title, theme=_theme, css=APP_CSS, fill_height=True) as demo:
 
         with gr.Row(elem_id="app-header"):
             gr.Markdown(
-                "**Talk2Data** &nbsp;·&nbsp; UP Child Nutrition Analytics"
-                " &nbsp;·&nbsp; 3.6 M records · Feb–Apr 2024",
+                f"**{ui_title}** &nbsp;·&nbsp; {ui_subtitle}",
                 elem_id="app-title",
             )
             toggle_btn = gr.Button(
-                "✕ Close Panel", size="sm", scale=0, min_width=120,
+                "✕ Close Panel",
+                size="sm",
+                scale=0,
+                min_width=120,
                 elem_id="panel-toggle-btn",
             )
 
@@ -161,10 +203,15 @@ def build_app(
 
         result_summary = gr.Markdown(value="_Run a query to see results._", render=False)
         result_table = gr.Dataframe(
-            value=pd.DataFrame(), label="Query Results",
-            datatype="auto", interactive=False, wrap=True,
-            show_row_numbers=True, show_search="filter",
-            buttons=["fullscreen", "copy"], max_height=340,
+            value=pd.DataFrame(),
+            label="Query Results",
+            datatype="auto",
+            interactive=False,
+            wrap=True,
+            show_row_numbers=True,
+            show_search="filter",
+            buttons=["fullscreen", "copy"],
+            max_height=340,
             render=False,
         )
 
@@ -178,14 +225,14 @@ def build_app(
                     additional_outputs=[result_summary, result_table],
                     show_progress="minimal",
                     save_history=save_history,
-                    examples=SAMPLE_QUERIES,
-                    example_labels=SAMPLE_QUERY_LABELS,
+                    examples=sample_queries,
+                    example_labels=sample_query_labels,
                     fill_height=True,
                 )
 
             with gr.Column(scale=3, visible=True, elem_id="side-col") as side_col:
                 with gr.Accordion("Getting Started & Tips", open=True):
-                    gr.Markdown(TIPS_MD)
+                    gr.Markdown(tips_md)
                 with gr.Accordion("Results", open=False):
                     result_summary.render()
                     result_table.render()
@@ -196,7 +243,11 @@ def build_app(
 
         def _toggle_panel(vis: bool):
             new_vis = not vis
-            return gr.update(visible=new_vis), gr.update(value="✕ Close Panel" if new_vis else "⊞ Open Panel"), new_vis
+            return (
+                gr.update(visible=new_vis),
+                gr.update(value="✕ Close Panel" if new_vis else "⊞ Open Panel"),
+                new_vis,
+            )
 
         toggle_btn.click(_toggle_panel, inputs=[panel_visible], outputs=[side_col, toggle_btn, panel_visible])
 
@@ -206,9 +257,8 @@ def build_app(
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
     orig = Path(get_original_cwd())
-    db_path = resolve_config_path(cfg.paths.db_path, orig)
-    verified_sql_path = resolve_config_path(cfg.paths.verified_sql_path, orig)
-    output_dir = resolve_config_path(cfg.paths.output_dir, orig)
+    runtime = DatasetRuntime.from_hydra(cfg, orig)
+    queries_path = runtime.queries_path
 
     merged_model = os.getenv("MODEL_NAME", cfg.llm.model)
     merged_temp = float(os.getenv("TEMPERATURE", str(cfg.llm.temperature)))
@@ -233,13 +283,27 @@ def main(cfg: DictConfig) -> None:
     share_env = os.getenv("GRADIO_SHARE")
     share = (share_env.lower() == "true") if share_env is not None else bool(cfg.gradio.share)
 
+    ds_ui = OmegaConf.select(cfg, "dataset.ui", default=None) or {}
+    ui_title = str(OmegaConf.select(ds_ui, "title", default="Talk2Data"))
+    ui_subtitle = str(OmegaConf.select(ds_ui, "subtitle", default=""))
+
+    sample_queries, sample_query_labels = _ui_samples(cfg, queries_path)
+    tips_md = _tips_markdown(cfg, orig)
+
     if warmup_on:
-        warmup_runtime(db_path=db_path, model=merged_model, temperature=merged_temp)
+        warmup_runtime(
+            db_path=runtime.db_path,
+            sqlalchemy_uri=runtime.sqlalchemy_uri,
+            schema_tables=runtime.schema_tables,
+            sample_sql=runtime.sample_sql,
+            model=merged_model,
+            temperature=merged_temp,
+        )
 
     demo = build_app(
-        db_path=db_path,
-        verified_sql_path=verified_sql_path,
-        output_dir=output_dir,
+        runtime=runtime,
+        queries_path=queries_path,
+        output_dir=runtime.output_dir,
         llm=llm,
         merged_model=merged_model,
         merged_temp=merged_temp,
@@ -248,6 +312,12 @@ def main(cfg: DictConfig) -> None:
         save_history=save_history,
         rephrase_kw=_rephrase_kwargs(cfg),
         table_row_limit=int(cfg.gradio.table_row_limit),
+        ui_title=ui_title,
+        ui_subtitle=ui_subtitle,
+        tips_md=tips_md,
+        sample_queries=sample_queries,
+        sample_query_labels=sample_query_labels,
+        ground_truth_db_id_filter=None,
     )
     demo.queue(default_concurrency_limit=qc, max_size=qm)
     demo.launch(

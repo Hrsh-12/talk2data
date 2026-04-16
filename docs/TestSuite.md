@@ -35,7 +35,7 @@ Markers are defined in [pytest.ini](../pytest.ini). `requires_db` tests are skip
 | REPH-002 | Edge | Empty raw_output | ok True empty | _build_rephrase_payload | status empty |
 | PATH-001 | Happy | resolve_config_path relative | orig=/repo | `database/x.duckdb` | `/repo/database/x.duckdb` |
 | PATH-002 | Happy | resolve_config_path absolute | orig=/repo | `/abs/x.duckdb` | `/abs/x.duckdb` |
-| GRADIO-001 | Happy | build_app returns Blocks | tmp db, verified path, mock llm | build_app(...) | gr.Blocks |
+| GRADIO-001 | Happy | build_app returns Blocks | tmp db, JSONL catalog path, mock llm | build_app(...) | gr.Blocks |
 | GRADIO-002 | Manual | Launch smoke ephemeral port | Deps installed | demo.launch(server_port=0); close | No bind error |
 | GRADIO-003 | Manual | Sample query from UI | Full stack | Click example | Table + reply |
 | GRADIO-004 | Edge | Unicode question | Running app + DB | Question with non-ASCII | No crash |
@@ -63,11 +63,11 @@ Markers are defined in [pytest.ini](../pytest.ini). `requires_db` tests are skip
 | BENCH-005 | Negative | parse missing file | Bad path | parse_verified_sql_by_query | FileNotFoundError |
 | BENCH-006 | Happy | compare_generated empty verified | DB | verified_sql_list [] | verdict not_checked |
 | BENCH-007 | Negative | compare_generated failed exec | sql_exec ok false | compare | verdict wrong |
-| CLI-001 | Happy | Single question positional | Built DB + CLI env | llm_to_sql.py 'Q?' | Exit 0 output |
-| CLI-002 | Happy | Config override on CLI | Built DB + CLI env | `llm_to_sql.py llm.model=x 'Q'` | Uses model x |
-| CLI-003 | Negative | Bad queries file path | None | --queries-file /no | Non-zero or error message |
-| CLI-004 | Edge | Batch trace JSON | queries file | --output-dir | JSON written |
-| APP-001 | Happy | ground_truth_html missing file | Path missing | ground_truth_html | Contains Verified file not found |
+| CLI-001 | Happy | Single question via Hydra | Built DB + CLI env | `llm_to_sql.py question='Q?'` | Exit 0 output |
+| CLI-002 | Happy | Config override on CLI | Built DB + CLI env | `llm_to_sql.py llm.model=x question='Q'` | Uses model x |
+| CLI-003 | Negative | Bad queries file path | None | `queries_file=/no` | Non-zero or error message |
+| CLI-004 | Edge | Batch trace JSON | queries file | `queries_file=... paths.output_dir=...` | JSON written |
+| APP-001 | Happy | ground_truth_html missing file | Path missing | ground_truth_html | Message mentions catalog / file not found |
 | APP-002 | Happy | _fallback_reply scalar | ok True one tuple | _fallback_reply | mentions result |
 | APP-003 | Negative | _fallback_reply sql error | ok False | _fallback_reply | SQL execution failed |
 | SQL-011 | Edge | extract_sql multiple statements first wins | Text with two SELECTs | extract_sql | First statement pattern |
@@ -80,7 +80,7 @@ Markers are defined in [pytest.ini](../pytest.ini). `requires_db` tests are skip
 | RUN-004 | Happy | run_query_dataframe wraps LIMIT | Valid SELECT | limit=5 | At most 5 rows |
 | BENCH-009 | Edge | compare_structured_values tuple order | Two tuples | element-wise compare | Match when values align |
 | BENCH-010 | Negative | parse_verified_sql_by_query no Q headers | SQL file without `-- Qn:` | parse | Empty or partial dict |
-| CLI-005 | Negative | llm_to_sql no question and no batch flags | None | argparse | Usage error or exit non-zero |
+| CLI-005 | Negative | llm_to_sql no question and no batch flags | None | Hydra defaults (`question=''`, `queries_file=null`) | Usage error or exit non-zero |
 | APP-004 | Happy | `_build_rephrase_payload` scalar tuple | ok True, one-column row | build payload | is_scalar True |
 | GRADIO-007 | Manual | Ground truth panel scroll | Verified SQL file exists | Open accordion | HTML table renders |
 | GRADIO-008 | Edge | `save_history` true | Gradio 5 | Two turns | History persisted per Gradio behavior |

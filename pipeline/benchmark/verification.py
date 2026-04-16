@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
 from typing import Any
 
 from pipeline.db.engine import (
@@ -95,34 +93,10 @@ def compare_structured_values(
     return left == right, True, max_diff
 
 
-def parse_verified_sql_by_query(path: Path) -> dict[int, list[str]]:
-    """Parse verified SQL file into a query-indexed mapping."""
-    if not path.exists():
-        raise FileNotFoundError(f"Verified SQL file not found: {path}")
-
-    text = path.read_text(encoding="utf-8")
-    header_re = re.compile(r"(?m)^--\s*Q(\d+)(?:\s+follow-up)?\s*:")
-    matches = list(header_re.finditer(text))
-    by_query: dict[int, list[str]] = {}
-
-    for idx, match in enumerate(matches):
-        query_index = int(match.group(1))
-        start = match.start()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-        block = text[start:end]
-        sql_only_lines = [line for line in block.splitlines() if not line.lstrip().startswith("--")]
-        sql_only_block = "\n".join(sql_only_lines).strip()
-        if not sql_only_block:
-            continue
-        stmt_matches = re.findall(r"(?is)\b(?:select|with)\b.*?;", sql_only_block)
-        if not stmt_matches:
-            continue
-        by_query.setdefault(query_index, []).extend(stmt.strip() for stmt in stmt_matches)
-    return by_query
-
-
 def compare_generated_with_verified(
-    db_path: Path,
+    sqlalchemy_uri: str,
+    schema_tables: list[str] | tuple[str, ...],
+    sample_sql: str | None,
     generated_sql_list: list[str],
     sql_exec: dict[str, Any],
     verified_sql_list: list[str],
@@ -159,7 +133,7 @@ def compare_generated_with_verified(
             "verified_results": None,
         }
 
-    db, _, _ = prepare_db_context(db_path)
+    db, _, _ = prepare_db_context(sqlalchemy_uri, list(schema_tables), sample_sql)
     expected_exec = execute_sql_list(db=db, sql_list=verified_sql_list)
     if not expected_exec.get("ok", False):
         return {

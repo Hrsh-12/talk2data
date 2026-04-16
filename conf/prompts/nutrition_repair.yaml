@@ -1,0 +1,17 @@
+meta:
+  description: SQL repair for nutrition pipeline.
+template: 'Fix the DuckDB SQL query so it executes successfully.
+
+  Return only corrected SQL, no explanation.
+
+
+  Broken SQL:
+
+  {broken_sql}
+
+
+  Execution error:
+
+  {error_text}
+
+  '

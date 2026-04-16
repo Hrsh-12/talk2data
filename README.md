@@ -21,7 +21,11 @@ python scripts/build_nutrition_db.py \
   --db database/nutrition_data.duckdb
 ```
 
-Point tools at it with **`DB_PATH`** (defaults to `database/nutrition_data.duckdb` in Hydra config). No daemon or port to start for DuckDB itself.
+Point tools at the DB with **`DB_PATH`** (defaults to `database/nutrition_data.duckdb` via [`conf/dataset/nutrition.yaml`](conf/dataset/nutrition.yaml)). You can keep large files under **`~/data/`** and set `DB_PATH=$HOME/data/nutrition_data.duckdb`. No daemon or port to start for DuckDB itself.
+
+**Query catalog (gold SQL):** paths default to **`data/nutrition_queries.jsonl`** (BIRD-style JSON lines: `question_id`, `db_id`, `question`, `evidence`, `SQL`, `difficulty`). Override with **`QUERIES_PATH`** or Hydra `paths.queries_path=...`. Legacy `-- Qn:` `.sql` files still load if pointed at a `.sql` path.
+
+**Switching datasets:** Hydra config group `dataset` — e.g. `python apps/gradio_app.py dataset=bird` (see [`conf/dataset/bird.yaml`](conf/dataset/bird.yaml)); set **`BIRD_DB_PATH`** / **`BIRD_QUERIES_PATH`** for paths outside the repo.
 
 Earlier pipeline stages (PDF lookups, labeling) are documented in [docs/Codebase.md](docs/Codebase.md).
 
@@ -58,12 +62,12 @@ Open the URL printed in the terminal (default **http://127.0.0.1:7860**). Overri
 ## Run CLI queries
 
 ```bash
-python scripts/llm_to_sql.py "Your question here?"
+python scripts/llm_to_sql.py question="Your question here?"
 ```
 
-Batch mode: `python scripts/llm_to_sql.py --queries-file "data/queries /queries.txt" --output-dir outputs`. Hydra-style overrides can follow the script name (see `scripts/llm_to_sql.py` docstring).
+Batch mode: `python scripts/llm_to_sql.py queries_file="data/queries/queries.txt"`. Outputs go to `paths.output_dir` (default `outputs/`); override with Hydra: `paths.output_dir=outputs`. Gold SQL for comparison comes from the catalog (`paths.queries_path`). Hydra-style overrides can follow the script name, e.g. `dataset=bird`.
 
 ## Further reading
 
 - [docs/Codebase.md](docs/Codebase.md) — layout and components  
-- [docs/ProjectStatus.md](docs/ProjectStatus.md) — status and gaps  
+- [docs/ProjectStatus.md](docs/ProjectStatus.md) — codebase guide and current scope  

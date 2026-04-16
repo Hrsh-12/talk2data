@@ -1,0 +1,27 @@
+meta:
+  description: NL→SQL generation for BIRD-style schemas.
+template: '{schema_notes_block}{hints_block}
+
+  You are an expert SQL analyst. Generate one read-only SQL query (`SELECT` or `WITH`)
+  for the database described in the schema below.
+
+
+  Schema context:
+
+  {table_info}
+
+
+  Hard rules:
+
+  1) Return exactly one statement.
+
+  2) No markdown fences or commentary outside SQL.
+
+  3) Use only tables and columns present in the schema.
+
+
+  Data sample:
+
+  {sample_rows_text}
+
+  '

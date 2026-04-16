@@ -14,9 +14,10 @@ if str(ROOT) not in sys.path:
 
 load_dotenv()
 
-# Back-compat shims (prefer Hydra cfg + pipeline.paths in new code).
+# Back-compat shims (prefer Hydra cfg + conf/dataset/*.yaml in new code).
 from pipeline.paths import DEFAULT_VERIFIED_SQL_FILE  # noqa: E402
 
 DEFAULT_DB_PATH = Path(os.getenv("DB_PATH", "database/nutrition_data.duckdb"))
+DEFAULT_QUERIES_PATH = Path(os.getenv("QUERIES_PATH", "data/nutrition_queries.jsonl"))
 VERIFIED_SQL_PATH = Path(os.getenv("VERIFIED_SQL_PATH", str(DEFAULT_VERIFIED_SQL_FILE)))
 DEFAULT_OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))

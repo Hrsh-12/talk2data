@@ -1,0 +1,25 @@
+# @package _global_
+# BIRD-style benchmark: set BIRD_DB_PATH / BIRD_QUERIES_PATH and override schema_tables for your DB.
+paths:
+  db_path: ${oc.env:BIRD_DB_PATH,~/bird_data/database.duckdb}
+  queries_path: ${oc.env:BIRD_QUERIES_PATH,~/bird_data/dev.jsonl}
+  output_dir: ${oc.env:OUTPUT_DIR,outputs}
+
+dataset:
+  schema_tables:
+    - frpm
+    - schools
+    - satscores
+  db_id: bird
+  sample_sql: null
+  sql_generation_prompt_path: conf/prompts/bird_sql.yaml
+  sql_repair_prompt_path: conf/prompts/bird_repair.yaml
+  schema_notes_path: null
+  hints_path: null
+  inject_evidence: true
+  ui:
+    title: "Talk2Data"
+    subtitle: "BIRD text-to-SQL"
+    tips_markdown: null
+    sample_queries: null
+    sample_query_labels: null
