@@ -1,4 +1,6 @@
-# ProjectStatus.md — Pipeline & Purpose
+# ProjectStatus.md — Pipeline, Schema & Text-to-SQL
+
+**Companion:** [`README.md`](../README.md) covers environment setup and shell commands. **This document** is the technical reference for **data layout, supervision signals, prompting, model roles, and evaluation** of the LLM-to-SQL stack (ML / analytics-heavy; not a deployment or DevOps checklist).
 
 ## 1. Core Mission
 
@@ -71,7 +73,7 @@ flowchart TD
 - **Script:** `scripts/build_nutrition_db.py`
 - **Input:** Labeled CSV
 - **Process:** Full CSV → pandas DataFrame → normalize `*_is_*` columns to 0/1 → `CREATE OR REPLACE TABLE` in DuckDB
-- **Output:** `database/nutrition_data.duckdb`
+- **Output:** User-selected path (Gradio default: `database/nutrition_data_filtered.duckdb`; full export often `database/nutrition_data.duckdb`)
 - **Note:** Loads entire CSV into memory. For the 3.6M-row dataset this requires ~4–8 GB RAM.
 
 #### Stage 4 — LLM-to-SQL Query
@@ -96,11 +98,119 @@ flowchart TD
 - **Comparison:** `compare_generated_with_verified()` performs structural + numeric diff with configurable tolerance
 - **Output:** Per-query verdicts (`right`/`wrong`/`not_checked`) in trace JSON
 
+### 2.3 ML-oriented view of the same pipeline
+
+The stack is best read as **deterministic feature and label construction** followed by **constrained program synthesis** over a frozen warehouse:
+
+| Stage | ML framing |
+|-------|------------|
+| **PDF → lookups** | Curating a **closed-world threshold library** (height/weight/age-dependent decision boundaries). This is the “teacher” specification, not learned. |
+| **Row-wise `classify_all()`** | Rule-based **multi-task labeling**: per month, each child receives categorical status heads (stunting, underweight, wasting) plus binary SAM / indicator columns. Equivalent to applying fixed decision functions in feature space. |
+| **DuckDB materialization** | **Materialized view** of the full labeled tensor: one row per child, wide layout over three time indices (`feb24_*`, `mar24_*`, `apr24_*`). No trainable weights; the value is a stable **execution substrate** for downstream querying. |
+| **NL → SQL** | **Conditional code generation**: the LM maps natural language to a single DuckDB `SELECT`/`WITH` program subject to schema and domain constraints (see §4). |
+| **Repair on error** | **One-step execution-guided refinement**: the engine feeds the failing SQL plus the database error string into the same model family for a second completion—akin to a single rejection sample, not a full search. |
+| **Rephrase** | **Separate conditional generation** task: a smaller LM turns structured execution output (JSON preview) into 1–2 sentences under strict **groundedness** rules (see §4.6). |
+| **Verified SQL suite** | **Behavioral evaluation**: compares *executed* result tuples (with numeric tolerances), not string equality of SQL—tests semantic alignment to reference analytics. |
+
 ---
 
-## 3. Current State
+## 3. DuckDB schema & supervision layout
 
-### 3.1 Functional (Production-Ready)
+### 3.1 Grain and panel structure
+
+- **Unit of analysis:** one row per child (`beneficiary_id`).
+- **Temporal scope:** three fixed waves encoded as **column prefixes**, not as a normalized time index: `feb24_`, `mar24_`, `apr24_` (February–April 2024).
+- **Implication for the LM:** longitudinal questions are expressed as **constraints across columns** (e.g. `feb24_stunting_status` vs `mar24_stunting_status`), not as `GROUP BY month` on a tall table.
+
+### 3.2 Column families (conceptual schema)
+
+| Family | Representative columns | Role in modeling / SQL |
+|--------|------------------------|-------------------------|
+| **Identity** | `beneficiary_id` | Primary key; defines independent samples for prevalence-style aggregates. |
+| **Demographics** | `dob`, `gender`, `birth_height`, `birth_weight` | Static covariates; low birth weight queries use explicit numeric thresholds on `birth_weight`. |
+| **Admin / geography** | `state_id`, `district_name`, `project_id`, `sector_id`, `awc_id`, `awc_code` | Categorical hierarchy; default app DB uses **`district_name` (VARCHAR)** after ID→name mapping. Filtering is equality on literal district strings. |
+| **Monthly raw** | `{m}_status`, `{m}_height`, `{m}_weight`, `{m}_height_weight_entered_date` | Measurements and administrative status for wave `m` ∈ {`feb24`,`mar24`,`apr24`}. |
+| **Monthly derived labels** | `{m}_stunting_status`, `{m}_is_stunted`, `{m}_underweight_status`, `{m}_is_underweight`, `{m}_wasting_status`, `{m}_is_wasted`, `{m}_is_sam` | **Multi-head supervision**: string heads carry ordered severity classes; `*_is_*` heads are Bernoulli-style indicators (stored numerically 0/1) for prevalence-style `AVG(CASE WHEN …)`. |
+
+**Scale (orders of magnitude):** full labeled CSV ≈3.6M rows × ~46 columns; filtered DuckDB default ≈3.45M rows — large enough that **sampling bias in the prompt** (only 3 rows shown to the LM) matters; the model relies heavily on **DDL + explicit enums** in the system prompt.
+
+### 3.3 Label spaces (closed vocabularies)
+
+The generator is instructed to treat these as **categorical literals** (case- and underscore-sensitive):
+
+- **`{m}_underweight_status`:** `normal`, `moderately_underweight`, `severely_underweight`
+- **`{m}_stunting_status`:** `normal`, `moderately_stunted`, `severely_stunted`
+- **`{m}_wasting_status`:** `normal`, `overweight`, `obese`, `MAM`, `SAM`
+
+**Transition semantics** (longitudinal): “moved from status A to B” is defined as **adjacent-month conjunction** on status columns (Feb→Mar and Mar→Apr only). This is a deliberate **task specification** injected into the prompt to reduce ambiguous interpretations.
+
+### 3.4 Relationship to `nutrition_labels.py`
+
+Lookup CSVs define **piecewise boundaries** in (age, sex, anthropometry) space. The classifier performs **nearest-neighbor / interpolation** where exact lookup keys are missing—still a deterministic map, but with smoothness assumptions analogous to **kernelized** threshold surfaces.
+
+---
+
+## 4. Text-to-SQL: prompts, models, and evaluation
+
+### 4.1 Grounding context (schema + few-row ICL)
+
+Implementation: `_prepare_db_context` / `_cached_prompt_context` in `src/nutrition_sql/service.py`.
+
+1. **`table_info`:** `SQLDatabase.get_table_info(["nutrition_data"])` — DuckDB DDL-style description injected into the system prompt.
+2. **`sample_rows_text`:** `SELECT * FROM nutrition_data LIMIT 3` — **literal few-shot rows** (all columns). Braces in string output are escaped so the outer `f"""` prompt does not corrupt template variables.
+3. **Caching:** `lru_cache` on resolved `db_path` string so repeated queries reuse the same **prefix** (stable few-shot unless the DB file changes and the process restarts).
+
+This is **retrieval-free** grounding: no vector store; the entire “knowledge” of column names and types is **symbolic** (DDL + samples).
+
+### 4.2 Primary system prompt (`_build_prompt`)
+
+Structured sections:
+
+1. **Task framing:** “expert DuckDB SQL analyst”, single-table restriction (`nutrition_data` only).
+2. **Injected blocks:** `{table_info}`, `{sample_rows_text}`.
+3. **Domain invariants:** month prefixes; prohibition on inventing months; enumeration of **exact** status string values; `district_name` filtering without joins.
+4. **Output contract:** single read-only statement; no markdown fences in model output (parsed downstream).
+5. **Numeric / SQL idioms:** `NULLIF` on denominators; `AVG(CASE WHEN indicator = 1 THEN 1 ELSE 0 END) * 100.0` for prevalence to avoid implicit casting pitfalls.
+6. **Query-type disambiguation:** count vs percentage; `LIMIT` behavior for “top N districts”; joint “normal on all three axes” semantics; **multi-step transitions** via `UNION ALL` when both Feb→Mar and Mar→Apr are requested.
+
+**Note:** `top_k` is threaded into `_build_prompt` but **not currently interpolated** into the template body—it is reserved API surface (e.g. future retrieval or beam hints).
+
+### 4.3 Primary generator model & decoding
+
+- **Client:** LangChain `ChatOpenAI`.
+- **Defaults (Gradio / env):** `MODEL_NAME` → `gpt-5-mini`, `TEMPERATURE` → `0.0` — **low-entropy** completions favoring reproducible SQL.
+- **User message pattern:** `f"{prompt}\n\nUser question:\n{question}"` — a single turn; no native multi-turn chat history in the core `run_single_question` path.
+
+### 4.4 SQL extraction (surface-form normalization)
+
+`_extract_sql` prefers ```sql fenced blocks, then generic fenced `select`, then regex from first `SELECT`/`WITH`. This is a **lightweight parser** on top of LM output; failures here are orthogonal to SQL semantics.
+
+### 4.5 Execution-guided repair
+
+On execution failure, `_repair_sql` sends a **minimal second prompt**: broken SQL + error text, instruction to return corrected SQL only. **Single repair attempt** — a trade-off between latency/cost and depth of search (no tree search, no k-best candidates).
+
+### 4.6 Rephrase model (NLG over structured results)
+
+`apps/result_utils.py` → `rephrase_reply`:
+
+- **Model:** `REPHRASE_MODEL_NAME` (default `gpt-4o-mini`), separate temperature / max_tokens / timeout.
+- **Input:** User question + JSON payload with truncated tabular preview (bounded rows / string length).
+- **Objective:** **Faithful compression** — rules explicitly forbid inventing columns or values; scalar answers limited to short numeric format.
+
+This is a **second-head** architecture: SQL LM optimizes for executable structure; rephrase LM optimizes for **human-readable, hallucination-averse** summaries conditioned on actual execution output.
+
+### 4.7 Evaluation protocol (`compare_generated_with_verified`)
+
+- Parses **golden SQL** from `queries_verified.sql` by query index.
+- Executes both generated and verified statements on the same DuckDB file.
+- Compares **parsed result structures** with mixed-type recursion; numeric closeness uses **absolute and relative tolerances** (`1e-9` each in code).
+- For list outputs, uses **sorted-by-`repr` tuple ordering** to reduce sensitivity to row order when sets are unordered—an explicit **evaluation transform** separate from user-facing ordering.
+
+---
+
+## 5. Current State
+
+### 5.1 Functional (Production-Ready)
 
 | Component | Status | Notes |
 |-----------|--------|-------|
@@ -113,7 +223,7 @@ flowchart TD
 | `apps/gradio_app.py` | ✅ Functional | Chat UI with result tables, rephrasing, and ground-truth reference. |
 | `data/queries/queries_verified.sql` | ✅ Complete | 28 benchmark queries (Q1–Q28) with verified results. |
 
-### 3.2 Work-in-Progress / Incomplete
+### 5.2 Work-in-Progress / Incomplete
 
 | Component | Status | Evidence |
 |-----------|--------|----------|
@@ -121,26 +231,26 @@ flowchart TD
 | **Normalized DB schema** | 🔶 Abandoned | `docs/PROJECT.md` describes a multi-table design (`beneficiaries`, `monthly_measurements`, lookup tables). `notebooks/01_explore.ipynb` validates a `child_health.duckdb` with this schema. The current pipeline only builds the flat `nutrition_data` table. |
 | **`src/utils.py`** | 🔶 Dead code | Defines `load_csv()` and `summarize()` but is never imported. |
 | **`prefer_verified_templates` routing** | 🔶 Disabled | Parameter exists in `run_single_question()` signature but is a documented no-op (`_ = prefer_verified_templates`). Template routing was removed. |
-| **`district_mapping.csv` integration** | 🔶 Unused in code | File exists but no script or service code imports or joins it. Some verified SQL references `district_name` which would require this mapping. |
+| **`district_mapping.csv` integration** | 🔶 Partial | `database/nutrition_data_filtered.duckdb` (Gradio default) uses `district_name` from this mapping. `build_nutrition_db.py` still loads CSV as-is (`district_id`); re-running the script overwrites the DB unless a mapping step is added. |
 
-### 3.3 Gaps and Missing Pieces
+### 5.3 ML / modeling gaps (not an ops backlog)
 
-| Gap | Impact | Recommendation |
-|-----|--------|----------------|
-| **No test suite** | High — regressions are undetectable. | Add pytest tests for `classify_all()`, `_extract_sql()`, `_is_read_only_sql()`, and integration tests for the SQL pipeline. |
-| **No CI/CD** | High — no automated quality gates. | Add GitHub Actions for linting, testing, and (optionally) building the DuckDB from a small test CSV. |
-| **No containerization** | Medium — environment reproducibility risk. | Add a `Dockerfile` and `docker-compose.yml` for the Gradio app + DuckDB. |
-| **No structured logging** | Medium — debugging is limited to `print()`. | Adopt Python `logging` with structured output. |
-| **No data validation** | Medium — schema drift is undetected. | Add a validation step (e.g., Great Expectations or a simple assertion script) between labeling and DB build. |
-| **No error monitoring** | Low — LLM failures are swallowed silently. | Add error tracking (Sentry, or at minimum file-based error logs). |
-| **`tqdm` missing from requirements** | Low — install may fail. | Add `tqdm>=4.0.0` to `requirements.txt`. |
-| **Space in `data/queries /` dirname** | Low — fragile. | Rename to `data/queries/` (no trailing space). |
+| Gap | Why it matters for the stack |
+|-----|-------------------------------|
+| **No feedback from user corrections** | SQL repair is **open-loop**; errors are not logged into a dataset for fine-tuning or preference optimization. |
+| **Single repair step** | No **beam search** or multi-candidate execution over generated SQL; may underperform on ambiguous questions. |
+| **Prompt context omits most rows** | Only 3 sample rows + DDL; **distribution shift** between prompt samples and global aggregates (e.g. rare districts) can drive mistakes despite correct schema text. |
+| **No uncertainty or abstention** | The LM never returns calibrated confidence; bad SQL is only caught by execution failure. |
+| **Verified suite = fixed 28 tasks** | Good regression signal but **narrow coverage** of the compositional space of analytics questions. |
+| **District mapping outside ETL** | Rebuilding DuckDB from CSV **drops** `district_name` unless a post-step is applied — train/serve skew if scripts and hand-migrated DB diverge. |
+
+**Operational / engineering items** (tests, CI, logging, path hygiene) remain important but are intentionally **out of scope** for this ML-focused status doc; track them in issue tickets or `README.md` if needed.
 
 ---
 
-## 4. Execution Flow — "How It Runs"
+## 6. Execution Flow — "How It Runs"
 
-### 4.1 First-Time Setup
+### 6.1 First-Time Setup
 
 ```bash
 # 1. Environment
@@ -158,7 +268,7 @@ echo "OPENAI_API_KEY=sk-..." > .env
 # 4. Place cleaned_dataset.csv in data/ (produced via notebook or external process)
 ```
 
-### 4.2 Pipeline Execution (Sequential)
+### 6.2 Pipeline Execution (Sequential)
 
 ```bash
 # Stage 0: Parse PDFs → lookup CSVs (skip if data/processed/*.csv already exist)
@@ -186,7 +296,7 @@ python scripts/llm_to_sql.py \
 python apps/gradio_app.py
 ```
 
-### 4.3 Entry Points Summary
+### 6.3 Entry Points Summary
 
 | Entry Point | Type | Command |
 |-------------|------|---------|
@@ -196,12 +306,12 @@ python apps/gradio_app.py
 | `scripts/llm_to_sql.py` | CLI (argparse) | `python scripts/llm_to_sql.py "question"` or `--queries-file` |
 | `apps/gradio_app.py` | Web server | `python apps/gradio_app.py` → `http://127.0.0.1:7860` |
 
-### 4.4 Environment Variables
+### 6.4 Environment Variables
 
 | Variable | Default | Used By |
 |----------|---------|---------|
 | `OPENAI_API_KEY` | *(required)* | `service.py`, transitive to all LLM calls |
-| `DB_PATH` | `database/nutrition_data.duckdb` | `gradio_app.py` |
+| `DB_PATH` | `database/nutrition_data_filtered.duckdb` | `gradio_app.py` |
 | `MODEL_NAME` | `gpt-5-mini` | `gradio_app.py` |
 | `REPHRASE_MODEL_NAME` | `gpt-4o-mini` | `gradio_app.py` |
 | `TOP_K` | `5` | `gradio_app.py` |
@@ -215,7 +325,7 @@ python apps/gradio_app.py
 | `GRADIO_QUEUE_MAX_SIZE` | `32` | `gradio_app.py` |
 | `GRADIO_SAVE_HISTORY` | `true` | `gradio_app.py` |
 
-### 4.5 Runtime Architecture
+### 6.5 Runtime Architecture
 
 ```mermaid
 flowchart TD
@@ -237,7 +347,7 @@ flowchart TD
 
 ---
 
-## 5. File Inventory
+## 7. File Inventory
 
 | Directory | Tracked Files | Gitignored Content | Role |
 |-----------|--------------|-------------------|------|

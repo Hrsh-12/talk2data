@@ -9,6 +9,8 @@ The core flow is:
 4. Run natural-language queries and capture SQL traces/results.
 5. (Optional) Use a Gradio chat UI for interactive querying.
 
+For **pipeline decomposition (ML view), DuckDB schema, text-to-SQL prompts, model roles, and evaluation**, see [`docs/ProjectStatus.md`](docs/ProjectStatus.md).
+
 ## Pipeline Diagram
 
 ```text
@@ -25,7 +27,7 @@ data/cleaned_dataset_with_labels.csv
    │
    ├── scripts/build_nutrition_db.py
    ▼
-database/nutrition_data.duckdb (table: nutrition_data)
+database/nutrition_data_filtered.duckdb (table: nutrition_data)
    │
    ├── scripts/llm_to_sql.py (single or batch CLI)
    ├── src/nutrition_sql/service.py (shared query service)
@@ -145,7 +147,7 @@ Environment variables (optional):
 - `GRADIO_SERVER_NAME` (default: `127.0.0.1`)
 - `GRADIO_SERVER_PORT` (default: `7860`)
 - `GRADIO_SHARE` (`true`/`false`, default: `false`)
-- `DB_PATH` (default: `database/nutrition_data.duckdb`)
+- `DB_PATH` (default: `database/nutrition_data_filtered.duckdb`)
 - `MODEL_NAME` (default: `gpt-5-mini`)
 - `TOP_K` (default: `5`)
 - `TEMPERATURE` (default: `0.0`)
@@ -159,10 +161,10 @@ GRADIO_SHARE=true python apps/gradio_app.py
 
 ## Data and Table Notes
 
-- Active DB file: `database/nutrition_data.duckdb`
+- Active DB file (Gradio / `DB_PATH` default): `database/nutrition_data_filtered.duckdb`
 - Active table: `nutrition_data`
 - Month prefixes: `feb24_`, `mar24_`, `apr24_`
-- Geography columns include `district_id`, `project_id`, `sector_id`, `awc_id`
+- Geography columns include `district_name`, `project_id`, `sector_id`, `awc_id`
 
 ## Common Regeneration Workflow
 
@@ -173,6 +175,7 @@ If source cleaned CSV changes:
 
 ## Repository Pointers
 
+- ML / schema / prompts / eval: `docs/ProjectStatus.md`
 - Project context: `docs/PROJECT.md`
 - Codebase details: `docs/CODEBASE.md`
 - EDA notes: `docs/Data EDA.md`

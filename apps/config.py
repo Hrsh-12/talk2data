@@ -14,7 +14,9 @@ if str(ROOT) not in sys.path:
 load_dotenv()
 
 # ── Paths ───────────────────────────────────────────────────────────────
-DEFAULT_DB_PATH = Path(os.getenv("DB_PATH", "database/nutrition_data.duckdb"))
+_db_env = os.getenv("DB_PATH", "database/nutrition_data_filtered.duckdb")
+_db_p = Path(_db_env)
+DEFAULT_DB_PATH = _db_p if _db_p.is_absolute() else (ROOT / _db_p)
 VERIFIED_SQL_PATH = ROOT / "data" / "queries " / "queries_verified.sql"
 DEFAULT_OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
 
