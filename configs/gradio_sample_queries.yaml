@@ -1,0 +1,105 @@
+sample_query_items:
+- query: What is the overall SAM prevalence in March 2024?
+  label: SAM Prevalence (Mar 2024)
+- query: Which 5 districts have the highest stunting rates in April 2024?
+  label: Top Stunted Districts (Apr 2024)
+- query: What is the total number of underweight children in February 2024?
+  label: Underweight Count (Feb 2024)
+- query: Compare wasting rates between male and female children in March 2024
+  label: Wasting by Gender (Mar 2024)
+- query: How has the SAM count changed from February to April 2024?
+  label: SAM Trend (Feb → Apr)
+- query: What percentage of children are stunted in Lucknow district?
+  label: Stunting in Lucknow
+- query: What is the SAM prevalence in Lucknow district in February 2024?
+  label: SAM in Lucknow (Feb 2024)
+- query: What percentage of children are stunted in Varanasi in February 2024?
+  label: Stunting % Varanasi (Feb 2024)
+- query: How many wasted children are there in Agra in February 2024?
+  label: Wasted count Agra (Feb 2024)
+- query: What is the underweight prevalence in Gorakhpur in February 2024?
+  label: Underweight % Gorakhpur (Feb 2024)
+- query: What is the SAM prevalence in Kanpur district in February 2024?
+  label: SAM in Kanpur (Feb 2024)
+- query: What percentage of children are stunted in Prayagraj in February 2024?
+  label: Stunting % Prayagraj (Feb 2024)
+- query: How many wasted children are there in Meerut in February 2024?
+  label: Wasted count Meerut (Feb 2024)
+- query: What is the underweight prevalence in Bareilly in February 2024?
+  label: Underweight % Bareilly (Feb 2024)
+- query: What is the SAM prevalence in Ghaziabad district in February 2024?
+  label: SAM in Ghaziabad (Feb 2024)
+- query: What percentage of children are stunted in Noida in February 2024?
+  label: Stunting % Noida (Feb 2024)
+- query: How many wasted children are there in Aligarh in February 2024?
+  label: Wasted count Aligarh (Feb 2024)
+- query: What is the underweight prevalence in Moradabad in February 2024?
+  label: Underweight % Moradabad (Feb 2024)
+- query: What is the SAM prevalence in Saharanpur district in February 2024?
+  label: SAM in Saharanpur (Feb 2024)
+- query: What percentage of children are stunted in Muzaffarnagar in February 2024?
+  label: Stunting % Muzaffarnagar (Feb 2024)
+- query: How many wasted children are there in Mathura in February 2024?
+  label: Wasted count Mathura (Feb 2024)
+- query: What is the underweight prevalence in Firozabad in February 2024?
+  label: Underweight % Firozabad (Feb 2024)
+- query: What is the SAM prevalence in Jhansi district in February 2024?
+  label: SAM in Jhansi (Feb 2024)
+- query: What percentage of children are stunted in Ayodhya in February 2024?
+  label: Stunting % Ayodhya (Feb 2024)
+- query: How many wasted children are there in Sitapur in February 2024?
+  label: Wasted count Sitapur (Feb 2024)
+- query: What is the underweight prevalence in Lakhimpur in February 2024?
+  label: Underweight % Lakhimpur (Feb 2024)
+- query: What is the SAM prevalence in Bahraich district in February 2024?
+  label: SAM in Bahraich (Feb 2024)
+- query: What percentage of children are stunted in Gonda in February 2024?
+  label: Stunting % Gonda (Feb 2024)
+- query: How many wasted children are there in Basti in February 2024?
+  label: Wasted count Basti (Feb 2024)
+- query: What is the underweight prevalence in Azamgarh in February 2024?
+  label: Underweight % Azamgarh (Feb 2024)
+- query: What is the SAM prevalence in Ballia district in February 2024?
+  label: SAM in Ballia (Feb 2024)
+- query: What percentage of children are stunted in Jaunpur in February 2024?
+  label: Stunting % Jaunpur (Feb 2024)
+- query: How many wasted children are there in Sultanpur in February 2024?
+  label: Wasted count Sultanpur (Feb 2024)
+- query: What is the underweight prevalence in Raebareli in February 2024?
+  label: Underweight % Raebareli (Feb 2024)
+- query: What is the SAM prevalence in Unnao district in February 2024?
+  label: SAM in Unnao (Feb 2024)
+- query: What percentage of children are stunted in Hardoi in February 2024?
+  label: Stunting % Hardoi (Feb 2024)
+- query: How many wasted children are there in Farrukhabad in February 2024?
+  label: Wasted count Farrukhabad (Feb 2024)
+- query: What is the underweight prevalence in Etawah in February 2024?
+  label: Underweight % Etawah (Feb 2024)
+- query: What is the SAM prevalence in Mainpuri district in February 2024?
+  label: SAM in Mainpuri (Feb 2024)
+- query: What percentage of children are stunted in Fatehpur in February 2024?
+  label: Stunting % Fatehpur (Feb 2024)
+- query: How many wasted children are there in Pratapgarh in February 2024?
+  label: Wasted count Pratapgarh (Feb 2024)
+- query: What is the underweight prevalence in Kaushambi in February 2024?
+  label: Underweight % Kaushambi (Feb 2024)
+- query: What is the SAM prevalence in Chandauli district in February 2024?
+  label: SAM in Chandauli (Feb 2024)
+- query: What percentage of children are stunted in Sonbhadra in February 2024?
+  label: Stunting % Sonbhadra (Feb 2024)
+- query: How many wasted children are there in Mirzapur in February 2024?
+  label: Wasted count Mirzapur (Feb 2024)
+- query: What is the underweight prevalence in Bhadohi in February 2024?
+  label: Underweight % Bhadohi (Feb 2024)
+- query: What is the SAM prevalence in Shahjahanpur district in February 2024?
+  label: SAM in Shahjahanpur (Feb 2024)
+- query: What percentage of children are stunted in Pilibhit in February 2024?
+  label: Stunting % Pilibhit (Feb 2024)
+- query: How many wasted children are there in Rampur in February 2024?
+  label: Wasted count Rampur (Feb 2024)
+- query: What is the underweight prevalence in Bijnor in February 2024?
+  label: Underweight % Bijnor (Feb 2024)
+- query: What is the SAM prevalence in Amroha district in February 2024?
+  label: SAM in Amroha (Feb 2024)
+- query: What percentage of children are stunted in Hapur in February 2024?
+  label: Stunting % Hapur (Feb 2024)

@@ -20,13 +20,18 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.nutrition_sql.service import (
+from src.text_sql.config import get_nutrition_settings
+from src.text_sql.service import (
     compare_generated_with_verified,
     parse_verified_sql_by_query,
     read_queries_file,
     run_single_question,
     save_batch_outputs,
 )
+
+
+def _resolve_repo_path(p: Path) -> Path:
+    return p if p.is_absolute() else (ROOT / p).resolve()
 
 
 def main() -> int:
@@ -36,17 +41,36 @@ def main() -> int:
         "--queries-file",
         help="Path to text file with one natural-language query per line",
     )
-    parser.add_argument("--db", default="database/nutrition_data.duckdb", help="Path to DuckDB file")
-    parser.add_argument("--model", default="gpt-5-mini", help="OpenAI-compatible chat model")
-    parser.add_argument("--temperature", type=float, default=0.0, help="LLM temperature")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to nutrition_text_to_sql.yaml (default: configs/nutrition_text_to_sql.yaml under repo root)",
+    )
+    parser.add_argument("--db", default=None, help="Path to DuckDB file (default from config YAML)")
+    parser.add_argument("--model", default=None, help="OpenAI-compatible chat model (default from config / env)")
+    parser.add_argument("--temperature", type=float, default=None, help="LLM temperature")
     parser.add_argument("--top-k", type=int, default=5, help="Preferred max rows in response")
-    parser.add_argument("--output-dir", default="outputs", help="Directory for saved batch trace files")
+    parser.add_argument("--output-dir", default=None, help="Directory for saved batch trace files")
     parser.add_argument(
         "--verified-sql-file",
-        default="data/queries /queries_verified.sql",
+        default=None,
         help="Path to verified SQL file used for result comparison in batch mode",
     )
     args = parser.parse_args()
+
+    cfg_path = args.config.resolve() if args.config else None
+    settings = get_nutrition_settings(cfg_path)
+
+    db_path = _resolve_repo_path(Path(args.db)) if args.db else settings.database_default_path
+    output_dir = _resolve_repo_path(Path(args.output_dir)) if args.output_dir else settings.output_dir
+    verified_sql_path = (
+        _resolve_repo_path(Path(args.verified_sql_file))
+        if args.verified_sql_file
+        else settings.verified_sql_path
+    )
+    model = args.model if args.model is not None else settings.llm_model
+    temperature = settings.llm_temperature if args.temperature is None else float(args.temperature)
 
     if not args.queries_file and not args.question:
         print("Error: provide either a question or --queries-file")
@@ -55,13 +79,13 @@ def main() -> int:
         print("Error: use either a single question OR --queries-file, not both")
         return 1
 
-    db_path = Path(args.db)
+    config_kw = {"config_path": cfg_path} if cfg_path else {}
 
     try:
         if args.queries_file:
-            queries_file = Path(args.queries_file)
+            queries_file = _resolve_repo_path(Path(args.queries_file))
             queries = read_queries_file(queries_file)
-            verified_sql_by_query = parse_verified_sql_by_query(Path(args.verified_sql_file))
+            verified_sql_by_query = parse_verified_sql_by_query(verified_sql_path)
             print(f"Loaded verified SQL for {len(verified_sql_by_query)} query indices")
             results: list[dict] = []
             for i, query in enumerate(queries, start=1):
@@ -69,9 +93,10 @@ def main() -> int:
                 run_result = run_single_question(
                     question=query,
                     db_path=db_path,
-                    model=args.model,
-                    temperature=args.temperature,
+                    model=model,
+                    temperature=temperature,
                     top_k=args.top_k,
+                    **config_kw,
                 )
                 verified_sql_list = verified_sql_by_query.get(i, [])
                 comparison = compare_generated_with_verified(
@@ -97,7 +122,7 @@ def main() -> int:
                 )
 
             json_path = save_batch_outputs(
-                output_dir=Path(args.output_dir),
+                output_dir=output_dir,
                 queries_file=queries_file,
                 db_path=db_path,
                 results=results,
@@ -110,9 +135,10 @@ def main() -> int:
         run_result = run_single_question(
             question=question,
             db_path=db_path,
-            model=args.model,
-            temperature=args.temperature,
+            model=model,
+            temperature=temperature,
             top_k=args.top_k,
+            **config_kw,
         )
         print("Generated SQL:")
         print(run_result["generated_sql"])

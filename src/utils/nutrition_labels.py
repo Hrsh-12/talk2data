@@ -10,11 +10,13 @@ Definitions:
 - Wasting / SAM / MAM: weight-for-height; compare child's weight to thresholds for (sex, age_band, height_cm).
 """
 
-from pathlib import Path
-import csv
+from __future__ import annotations
 
-# Default paths relative to project root
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+import csv
+from pathlib import Path
+
+# Default paths relative to project root (this file: src/utils/nutrition_labels.py)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 

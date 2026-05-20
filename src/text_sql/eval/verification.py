@@ -1,0 +1,222 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any
+
+from ..results.parse import parse_verified_comparison_value
+from ..sql.execute import execute_sql_list, extract_exec_items, open_sql_database
+from ..sql.extract import normalize_sql
+
+
+def compare_structured_values(
+    left: Any,
+    right: Any,
+    *,
+    abs_tol: float,
+    rel_tol: float,
+) -> tuple[bool, bool, float]:
+    max_diff = 0.0
+
+    is_num_left = isinstance(left, (int, float)) and not isinstance(left, bool)
+    is_num_right = isinstance(right, (int, float)) and not isinstance(right, bool)
+    if is_num_left and is_num_right:
+        diff = abs(float(left) - float(right))
+        allowed = max(abs_tol, rel_tol * max(abs(float(left)), abs(float(right)), 1.0))
+        return diff <= allowed, True, diff
+
+    if type(left) is not type(right):
+        return False, False, max_diff
+
+    if isinstance(left, list):
+        if len(left) != len(right):
+            return False, False, max_diff
+        left_items = sorted(left, key=repr)
+        right_items = sorted(right, key=repr)
+        all_match = True
+        all_shape = True
+        for l_item, r_item in zip(left_items, right_items):
+            match, shape, diff = compare_structured_values(
+                l_item,
+                r_item,
+                abs_tol=abs_tol,
+                rel_tol=rel_tol,
+            )
+            all_match = all_match and match
+            all_shape = all_shape and shape
+            max_diff = max(max_diff, diff)
+        return all_match, all_shape, max_diff
+
+    if isinstance(left, tuple):
+        if len(left) != len(right):
+            return False, False, max_diff
+        all_match = True
+        all_shape = True
+        for l_item, r_item in zip(left, right):
+            match, shape, diff = compare_structured_values(
+                l_item,
+                r_item,
+                abs_tol=abs_tol,
+                rel_tol=rel_tol,
+            )
+            all_match = all_match and match
+            all_shape = all_shape and shape
+            max_diff = max(max_diff, diff)
+        return all_match, all_shape, max_diff
+
+    if isinstance(left, dict):
+        if set(left.keys()) != set(right.keys()):
+            return False, False, max_diff
+        all_match = True
+        all_shape = True
+        for key in sorted(left):
+            match, shape, diff = compare_structured_values(
+                left[key],
+                right[key],
+                abs_tol=abs_tol,
+                rel_tol=rel_tol,
+            )
+            all_match = all_match and match
+            all_shape = all_shape and shape
+            max_diff = max(max_diff, diff)
+        return all_match, all_shape, max_diff
+
+    return left == right, True, max_diff
+
+
+def parse_verified_sql_by_query(path: Path) -> dict[int, list[str]]:
+    """Parse verified SQL file into a query-indexed mapping."""
+    if not path.exists():
+        raise FileNotFoundError(f"Verified SQL file not found: {path}")
+
+    text = path.read_text(encoding="utf-8")
+    header_re = re.compile(r"(?m)^--\s*Q(\d+)(?:\s+follow-up)?\s*:")
+    matches = list(header_re.finditer(text))
+    by_query: dict[int, list[str]] = {}
+
+    for idx, match in enumerate(matches):
+        query_index = int(match.group(1))
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        block = text[start:end]
+        sql_only_lines = [line for line in block.splitlines() if not line.lstrip().startswith("--")]
+        sql_only_block = "\n".join(sql_only_lines).strip()
+        if not sql_only_block:
+            continue
+        stmt_matches = re.findall(r"(?is)\b(?:select|with)\b.*?;", sql_only_block)
+        if not stmt_matches:
+            continue
+        by_query.setdefault(query_index, []).extend(stmt.strip() for stmt in stmt_matches)
+    return by_query
+
+
+def compare_generated_with_verified(
+    db_path: Path,
+    generated_sql_list: list[str],
+    sql_exec: dict[str, Any],
+    verified_sql_list: list[str],
+    *,
+    abs_tolerance: float | None = None,
+    rel_tolerance: float | None = None,
+) -> dict[str, Any]:
+    """Compare generated SQL execution outputs with verified SQL outputs."""
+    if abs_tolerance is not None and rel_tolerance is not None:
+        abs_tol, rel_tol = abs_tolerance, rel_tolerance
+    else:
+        from ..config.settings import get_default_nutrition_settings
+
+        defaults = get_default_nutrition_settings()
+        abs_tol = defaults.eval_abs_tolerance if abs_tolerance is None else abs_tolerance
+        rel_tol = defaults.eval_rel_tolerance if rel_tolerance is None else rel_tolerance
+
+    if not verified_sql_list:
+        return {
+            "checked": False,
+            "verdict": "not_checked",
+            "reason": "No verified SQL found for this query index",
+            "exact_sql_match": None,
+            "same_result": None,
+            "shape_match": None,
+            "max_numeric_diff": None,
+            "tolerance_used": {"abs": abs_tol, "rel": rel_tol},
+            "generated_results": None,
+            "verified_results": None,
+        }
+
+    if not sql_exec.get("ok", False):
+        return {
+            "checked": True,
+            "verdict": "wrong",
+            "reason": "Generated SQL execution failed",
+            "exact_sql_match": False,
+            "same_result": False,
+            "shape_match": None,
+            "max_numeric_diff": None,
+            "tolerance_used": {"abs": abs_tol, "rel": rel_tol},
+            "generated_results": extract_exec_items(sql_exec=sql_exec, generated_sql_list=generated_sql_list),
+            "verified_results": None,
+        }
+
+    db = open_sql_database(db_path)
+    expected_exec = execute_sql_list(db=db, sql_list=verified_sql_list)
+    if not expected_exec.get("ok", False):
+        return {
+            "checked": False,
+            "verdict": "not_checked",
+            "reason": "Verified SQL execution failed unexpectedly",
+            "exact_sql_match": None,
+            "same_result": None,
+            "shape_match": None,
+            "max_numeric_diff": None,
+            "tolerance_used": {"abs": abs_tol, "rel": rel_tol},
+            "generated_results": extract_exec_items(sql_exec=sql_exec, generated_sql_list=generated_sql_list),
+            "verified_results": expected_exec.get("results"),
+        }
+
+    actual_items = extract_exec_items(sql_exec=sql_exec, generated_sql_list=generated_sql_list)
+    expected_items = expected_exec["results"]
+
+    actual_sql_norm = [normalize_sql(x["sql"]) for x in actual_items]
+    expected_sql_norm = [normalize_sql(x["sql"]) for x in expected_items]
+    exact_sql_match = actual_sql_norm == expected_sql_norm
+
+    shape_match = len(actual_items) == len(expected_items)
+    same_result = shape_match
+    max_numeric_diff = 0.0
+    for actual, expected in zip(actual_items, expected_items):
+        actual_parsed = parse_verified_comparison_value(actual.get("raw_output"))
+        expected_parsed = parse_verified_comparison_value(expected.get("raw_output"))
+        match, shape, diff = compare_structured_values(
+            actual_parsed,
+            expected_parsed,
+            abs_tol=abs_tol,
+            rel_tol=rel_tol,
+        )
+        same_result = same_result and match
+        shape_match = shape_match and shape
+        max_numeric_diff = max(max_numeric_diff, diff)
+
+    if len(actual_items) != len(expected_items):
+        reason = (
+            f"Different SQL statement count: generated={len(actual_items)} "
+            f"verified={len(expected_items)}"
+        )
+    elif not shape_match:
+        reason = "Result shape differs from verified SQL output"
+    else:
+        reason = "Matches verified output" if same_result else "Output differs from verified SQL output"
+
+    return {
+        "checked": True,
+        "verdict": "right" if same_result else "wrong",
+        "reason": reason,
+        "exact_sql_match": exact_sql_match,
+        "same_result": same_result,
+        "shape_match": shape_match,
+        "max_numeric_diff": max_numeric_diff,
+        "tolerance_used": {"abs": abs_tol, "rel": rel_tol},
+        "generated_statement_count": len(actual_items),
+        "verified_statement_count": len(expected_items),
+        "generated_results": actual_items,
+        "verified_results": expected_items,
+    }

@@ -1,3 +1,5 @@
+"""Small pandas helpers for notebooks and ad-hoc CSV inspection."""
+
 import pandas as pd
 
 

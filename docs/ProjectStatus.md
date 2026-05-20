@@ -1,6 +1,6 @@
-# ProjectStatus.md — Pipeline, Schema & Text-to-SQL
+# ProjectStatus.md — Pipeline, Schema, Text-to-SQL & Semantic Cache
 
-**Companion:** [`README.md`](../README.md) covers environment setup and shell commands. **This document** is the technical reference for **data layout, supervision signals, prompting, model roles, and evaluation** of the LLM-to-SQL stack (ML / analytics-heavy; not a deployment or DevOps checklist).
+**Companion:** [`README.md`](../README.md) covers environment setup and shell commands. **This document** is the technical reference for **data layout, supervision signals, prompting, semantic query caching, model roles, and evaluation** of the LLM-to-SQL stack (ML / analytics-heavy; not a deployment or DevOps checklist).
 
 ## 1. Core Mission
 
@@ -10,7 +10,7 @@
 1. Ingests raw child health measurement records (~18.3M rows across 3 months).
 2. Classifies each child's nutritional status using WHO-standard anthropometric thresholds.
 3. Loads the labeled data into an embedded analytics database (DuckDB).
-4. Enables natural-language querying via LLM-generated SQL with a self-repair loop.
+4. Enables natural-language querying via a semantic cache for known questions and LLM-generated SQL with a self-repair loop for new questions.
 5. Presents results through a Gradio chat UI with result rephrasing and tabular display.
 
 **Domain:** Public health nutrition analytics — specifically child malnutrition indicators (stunting, underweight, wasting, SAM/MAM) for children aged 0–6 years in Uttar Pradesh, India, over Feb–Apr 2024.
@@ -36,11 +36,17 @@ flowchart TD
     H --> I[build_nutrition_db.py]
     I --> J[(DuckDB — nutrition_data)]
 
-    J --> K[service.py]
+    J --> K[text_sql]
     L[OpenAI API] <--> K
     K --> M[llm_to_sql.py — CLI]
     K --> N[Gradio Chat UI]
     M --> O[outputs/*.json — Traces]
+
+    T["queries.txt seed questions"] --> R[build_semantic_query_index.py]
+    J --> R
+    L <--> R
+    R --> S[(Semantic Query Cache)]
+    S --> N
 
     O --> P[Validation — compare with verified SQL]
     Q[queries_verified.sql — 28 benchmarks] --> P
@@ -65,7 +71,7 @@ flowchart TD
 #### Stage 2 — Nutrition Labeling
 - **Script:** `scripts/add_nutrition_labels.py`
 - **Input:** Cleaned CSV + lookup tables (from Stage 0)
-- **Process:** Streams in 50k-row chunks. For each row and each month (`feb24`, `mar24`, `apr24`), calls `classify_all()` from `src/nutrition_labels.py`. Drops rows with zero height/weight.
+- **Process:** Streams in 50k-row chunks. For each row and each month (`feb24`, `mar24`, `apr24`), calls `classify_all()` from `src/utils/nutrition_labels.py`. Drops rows with zero height/weight.
 - **Output:** `data/cleaned_dataset_with_labels.csv` (~3.64M rows, 46 columns)
 - **Runtime:** Significant — row-by-row classification over 3.6M × 3 months.
 
@@ -77,7 +83,7 @@ flowchart TD
 - **Note:** Loads entire CSV into memory. For the 3.6M-row dataset this requires ~4–8 GB RAM.
 
 #### Stage 4 — LLM-to-SQL Query
-- **Service:** `src/nutrition_sql/service.py`
+- **Service:** `src/text_sql/service/` (facade over `engine/`)
 - **Process:**
   1. Cache schema introspection + 3 sample rows from DuckDB
   2. Build grounded prompt with business rules and SQL patterns
@@ -91,6 +97,19 @@ flowchart TD
 - **Interfaces:**
   - **CLI:** `scripts/llm_to_sql.py` (single question or batch from file)
   - **Web:** `apps/gradio_app.py` (Gradio chat with result rephrasing)
+
+#### Stage 4.5 — Semantic Query Cache
+- **Package:** `src/text_sql/semantic_cache/`
+- **Build script:** `scripts/build_semantic_query_index.py`
+- **Artifacts:** `database/semantic_query_cache/embedding_index.faiss` and `database/semantic_query_cache/indexed_queries.jsonl`
+- **Process:**
+  1. Read seed questions from `data/queries/queries.txt` or another one-question-per-line file
+  2. Run each seed question through `run_single_question()`
+  3. Store `natural_language_query`, `query_intent_summary`, `generated_sql`, `sql_execution`, `natural_language_summary`, and database freshness metadata as `IndexedQuery` records
+  4. Embed each seed question with SentenceTransformers and write a normalized FAISS `IndexFlatIP`
+  5. At Gradio runtime, search top-1 before the LLM path and use the cached payload when cosine similarity is at least `SEMANTIC_QUERY_CACHE_MIN_SIMILARITY` (default `0.95`)
+
+- **Runtime behavior:** cache hits skip SQL-generation LLM calls. If configured, Gradio re-executes cached SQL against the current DuckDB before rendering.
 
 #### Stage 5 — Validation
 - **Benchmark:** 28 curated questions in `data/queries/queries.txt`
@@ -108,6 +127,7 @@ The stack is best read as **deterministic feature and label construction** follo
 | **Row-wise `classify_all()`** | Rule-based **multi-task labeling**: per month, each child receives categorical status heads (stunting, underweight, wasting) plus binary SAM / indicator columns. Equivalent to applying fixed decision functions in feature space. |
 | **DuckDB materialization** | **Materialized view** of the full labeled tensor: one row per child, wide layout over three time indices (`feb24_*`, `mar24_*`, `apr24_*`). No trainable weights; the value is a stable **execution substrate** for downstream querying. |
 | **NL → SQL** | **Conditional code generation**: the LM maps natural language to a single DuckDB `SELECT`/`WITH` program subject to schema and domain constraints (see §4). |
+| **Semantic query cache** | **Nearest-neighbor retrieval over prior questions**: known questions and close paraphrases reuse stored SQL, execution results, intent summaries, and optional natural-language summaries before falling back to code generation. |
 | **Repair on error** | **One-step execution-guided refinement**: the engine feeds the failing SQL plus the database error string into the same model family for a second completion—akin to a single rejection sample, not a full search. |
 | **Rephrase** | **Separate conditional generation** task: a smaller LM turns structured execution output (JSON preview) into 1–2 sentences under strict **groundedness** rules (see §4.6). |
 | **Verified SQL suite** | **Behavioral evaluation**: compares *executed* result tuples (with numeric tolerances), not string equality of SQL—tests semantic alignment to reference analytics. |
@@ -144,7 +164,7 @@ The generator is instructed to treat these as **categorical literals** (case- an
 
 **Transition semantics** (longitudinal): “moved from status A to B” is defined as **adjacent-month conjunction** on status columns (Feb→Mar and Mar→Apr only). This is a deliberate **task specification** injected into the prompt to reduce ambiguous interpretations.
 
-### 3.4 Relationship to `nutrition_labels.py`
+### 3.4 Relationship to `src/utils/nutrition_labels.py`
 
 Lookup CSVs define **piecewise boundaries** in (age, sex, anthropometry) space. The classifier performs **nearest-neighbor / interpolation** where exact lookup keys are missing—still a deterministic map, but with smoothness assumptions analogous to **kernelized** threshold surfaces.
 
@@ -154,13 +174,13 @@ Lookup CSVs define **piecewise boundaries** in (age, sex, anthropometry) space. 
 
 ### 4.1 Grounding context (schema + few-row ICL)
 
-Implementation: `_prepare_db_context` / `_cached_prompt_context` in `src/nutrition_sql/service.py`.
+Implementation: schema + sample ICL caching in `src/text_sql/grounding/schema.py`; orchestration in `src/text_sql/engine/pipeline.py`.
 
 1. **`table_info`:** `SQLDatabase.get_table_info(["nutrition_data"])` — DuckDB DDL-style description injected into the system prompt.
 2. **`sample_rows_text`:** `SELECT * FROM nutrition_data LIMIT 3` — **literal few-shot rows** (all columns). Braces in string output are escaped so the outer `f"""` prompt does not corrupt template variables.
 3. **Caching:** `lru_cache` on resolved `db_path` string so repeated queries reuse the same **prefix** (stable few-shot unless the DB file changes and the process restarts).
 
-This is **retrieval-free** grounding: no vector store; the entire “knowledge” of column names and types is **symbolic** (DDL + samples).
+The core SQL generator is still **retrieval-free**: schema knowledge is **symbolic** (DDL + samples), not vector-retrieved. The Gradio app now has an optional semantic query cache in front of this generator; cache misses continue through the same grounded prompt path.
 
 ### 4.2 Primary system prompt (`_build_prompt`)
 
@@ -199,7 +219,18 @@ On execution failure, `_repair_sql` sends a **minimal second prompt**: broken SQ
 
 This is a **second-head** architecture: SQL LM optimizes for executable structure; rephrase LM optimizes for **human-readable, hallucination-averse** summaries conditioned on actual execution output.
 
-### 4.7 Evaluation protocol (`compare_generated_with_verified`)
+### 4.7 Semantic query cache
+
+`src/text_sql/semantic_cache/` implements a local FAISS-backed query cache for previously answered questions:
+
+- **Record model:** `IndexedQuery` stores `natural_language_query`, `query_intent_summary`, `generated_sql`, `sql_execution`, optional `natural_language_summary`, `database_path`, and `database_file_mtime_ns`.
+- **Index model:** `SemanticQueryIndex` loads `embedding_index.faiss` plus aligned `indexed_queries.jsonl`, embeds the incoming question, searches top-1, and accepts only matches above `SEMANTIC_QUERY_CACHE_MIN_SIMILARITY` (default `0.95`).
+- **Embedding model:** default `sentence-transformers/all-MiniLM-L6-v2`; vectors are L2-normalized and searched via FAISS `IndexFlatIP`, so inner product equals cosine similarity.
+- **Build path:** `scripts/build_semantic_query_index.py` runs seed questions through the existing engine, uses `rephrase_reply()` for cached answer text, uses a short intent-classification prompt (`configs/prompts/query_intent_classification.md`), and writes the local artifacts.
+- **Runtime path:** `apps/gradio_app.py` lazy-loads the index when `SEMANTIC_QUERY_CACHE_ENABLED=true`; hits return cached SQL/results to the same Gradio result renderer, misses fall through to `run_single_question()`.
+- **Freshness:** if `SEMANTIC_QUERY_CACHE_REEXECUTE_ON_HIT=true`, or if the DuckDB path/mtime differs from the cached record, Gradio re-executes cached SQL before display. If re-execution fails, it falls back to the normal LLM path.
+
+### 4.8 Evaluation protocol (`compare_generated_with_verified`)
 
 - Parses **golden SQL** from `queries_verified.sql` by query index.
 - Executes both generated and verified statements on the same DuckDB file.
@@ -216,10 +247,12 @@ This is a **second-head** architecture: SQL LM optimizes for executable structur
 |-----------|--------|-------|
 | `scripts/parse_assessment_pdfs.py` | ✅ Functional | Produces correct lookup CSVs; idempotent. |
 | `scripts/add_nutrition_labels.py` | ✅ Functional | Chunked streaming; handles edge cases (zero metrics, missing DOB). |
-| `src/nutrition_labels.py` | ✅ Functional | Complete classification engine with nearest-neighbor interpolation for missing lookup keys. |
+| `src/utils/nutrition_labels.py` | ✅ Functional | Complete classification engine with nearest-neighbor interpolation for missing lookup keys. |
 | `scripts/build_nutrition_db.py` | ✅ Functional | Clean DuckDB build with bool normalization. |
-| `src/nutrition_sql/service.py` | ✅ Functional | Full NL→SQL pipeline with repair loop and benchmarking support. |
+| `src/text_sql/` (`service/`, `engine/`, `eval/`, …) | ✅ Functional | Full NL→SQL pipeline with repair loop and benchmarking support. |
+| `src/text_sql/semantic_cache/` | ✅ Functional | FAISS-backed semantic query index with JSONL corpus records and thresholded top-1 lookup. |
 | `scripts/llm_to_sql.py` | ✅ Functional | CLI supports single and batch modes with trace output. |
+| `scripts/build_semantic_query_index.py` | ✅ Functional | Builds `embedding_index.faiss` and `indexed_queries.jsonl` from seed questions, SQL outputs, summaries, and intent labels. |
 | `apps/gradio_app.py` | ✅ Functional | Chat UI with result tables, rephrasing, and ground-truth reference. |
 | `data/queries/queries_verified.sql` | ✅ Complete | 28 benchmark queries (Q1–Q28) with verified results. |
 
@@ -242,6 +275,7 @@ This is a **second-head** architecture: SQL LM optimizes for executable structur
 | **Prompt context omits most rows** | Only 3 sample rows + DDL; **distribution shift** between prompt samples and global aggregates (e.g. rare districts) can drive mistakes despite correct schema text. |
 | **No uncertainty or abstention** | The LM never returns calibrated confidence; bad SQL is only caught by execution failure. |
 | **Verified suite = fixed 28 tasks** | Good regression signal but **narrow coverage** of the compositional space of analytics questions. |
+| **Semantic cache seed set is small** | Cache quality depends on the number and diversity of stored questions; close paraphrases benefit, but genuinely new analytics still need the LLM path. |
 | **District mapping outside ETL** | Rebuilding DuckDB from CSV **drops** `district_name` unless a post-step is applied — train/serve skew if scripts and hand-migrated DB diverge. |
 
 **Operational / engineering items** (tests, CI, logging, path hygiene) remain important but are intentionally **out of scope** for this ML-focused status doc; track them in issue tickets or `README.md` if needed.
@@ -289,10 +323,21 @@ python scripts/llm_to_sql.py "What is the SAM prevalence in March 2024?"
 
 # Stage 4b: CLI query (batch with verification)
 python scripts/llm_to_sql.py \
-  --queries-file "data/queries /queries.txt" \
+  --queries-file data/queries/queries.txt \
   --output-dir outputs
 
-# Stage 5: Launch Gradio UI
+# Stage 4c: Build semantic query cache (optional but recommended for Gradio)
+python scripts/build_semantic_query_index.py \
+  --queries-file data/queries/queries.txt \
+  --database database/nutrition_data_filtered.duckdb \
+  --output-directory database/semantic_query_cache
+
+# Stage 5: Launch Gradio UI without cache
+python apps/gradio_app.py
+
+# Or launch Gradio with semantic query cache enabled
+SEMANTIC_QUERY_CACHE_ENABLED=true \
+SEMANTIC_QUERY_CACHE_DIRECTORY=database/semantic_query_cache \
 python apps/gradio_app.py
 ```
 
@@ -304,13 +349,14 @@ python apps/gradio_app.py
 | `scripts/add_nutrition_labels.py` | CLI (argparse) | `python scripts/add_nutrition_labels.py [--input] [--output] [--chunksize]` |
 | `scripts/build_nutrition_db.py` | CLI (argparse) | `python scripts/build_nutrition_db.py [--csv] [--db] [--table]` |
 | `scripts/llm_to_sql.py` | CLI (argparse) | `python scripts/llm_to_sql.py "question"` or `--queries-file` |
+| `scripts/build_semantic_query_index.py` | CLI (argparse) | `python scripts/build_semantic_query_index.py --queries-file data/queries/queries.txt --database database/nutrition_data_filtered.duckdb --output-directory database/semantic_query_cache` |
 | `apps/gradio_app.py` | Web server | `python apps/gradio_app.py` → `http://127.0.0.1:7860` |
 
 ### 6.4 Environment Variables
 
 | Variable | Default | Used By |
 |----------|---------|---------|
-| `OPENAI_API_KEY` | *(required)* | `service.py`, transitive to all LLM calls |
+| `OPENAI_API_KEY` | *(required)* | `src/text_sql/` (LLM calls), Gradio rephrase |
 | `DB_PATH` | `database/nutrition_data_filtered.duckdb` | `gradio_app.py` |
 | `MODEL_NAME` | `gpt-5-mini` | `gradio_app.py` |
 | `REPHRASE_MODEL_NAME` | `gpt-4o-mini` | `gradio_app.py` |
@@ -324,25 +370,41 @@ python apps/gradio_app.py
 | `GRADIO_QUEUE_CONCURRENCY` | `2` | `gradio_app.py` |
 | `GRADIO_QUEUE_MAX_SIZE` | `32` | `gradio_app.py` |
 | `GRADIO_SAVE_HISTORY` | `true` | `gradio_app.py` |
+| `SEMANTIC_QUERY_CACHE_ENABLED` | `false` | `gradio_app.py` |
+| `SEMANTIC_QUERY_CACHE_DIRECTORY` | `database/semantic_query_cache` | `gradio_app.py` |
+| `SEMANTIC_QUERY_CACHE_MIN_SIMILARITY` | `0.95` | `gradio_app.py` |
+| `SEMANTIC_QUERY_CACHE_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | `gradio_app.py`, `build_semantic_query_index.py` |
+| `SEMANTIC_QUERY_CACHE_REEXECUTE_ON_HIT` | `false` | `gradio_app.py` |
 
 ### 6.5 Runtime Architecture
 
 ```mermaid
 flowchart TD
     A[User enters question] --> B[Gradio UI]
-    B --> C[service.py — run_single_question]
-    C --> D[Build prompt from cached schema + sample rows]
-    D --> E[OpenAI API — generate SQL]
-    E --> F[Extract SQL from LLM response]
-    F --> G[Read-only check]
-    G --> H[Execute SQL on DuckDB]
-    H --> I{Success?}
-    I -- Yes --> K[Return result]
-    I -- No --> J[OpenAI API — repair SQL]
-    J --> H
-    K --> L[Rephrase result via LLM]
-    L --> M[Gradio UI — chat reply + table + summary]
-    M --> N[User sees answer]
+    B --> C{"Semantic cache enabled?"}
+    C -- Yes --> D[Load SemanticQueryIndex]
+    D --> E[Embed question and search FAISS top1]
+    E --> F{"Similarity >= threshold?"}
+    F -- Yes --> G[Use IndexedQuery SQL and cached result]
+    G --> H{"Re-execute SQL?"}
+    H -- Yes --> I[Execute cached SQL on DuckDB]
+    H -- No --> J[Use cached sql_execution]
+    I --> K[Build result table]
+    J --> K
+    F -- No --> L[text_sql run_single_question]
+    C -- No --> L
+    L --> M[Build prompt from cached schema and sample rows]
+    M --> N[OpenAI API generate SQL]
+    N --> O[Extract SQL]
+    O --> P[Read-only check and execute on DuckDB]
+    P --> Q{"Success?"}
+    Q -- No --> R[OpenAI API repair SQL]
+    R --> P
+    Q -- Yes --> S[Return execution payload]
+    S --> T[Rephrase result via LLM]
+    K --> U[Gradio chat reply plus table]
+    T --> U
+    U --> V[User sees answer]
 ```
 
 ---
@@ -351,11 +413,11 @@ flowchart TD
 
 | Directory | Tracked Files | Gitignored Content | Role |
 |-----------|--------------|-------------------|------|
-| `apps/` | 1 | — | Web UI |
-| `scripts/` | 4 | — | ETL pipeline |
-| `src/` | 5 | — | Core library |
+| `apps/` | 3 | — | Web UI, config, result formatting / rephrase helpers |
+| `scripts/` | 5 | — | ETL pipeline, LLM batch runner, semantic cache builder |
+| `src/` | package modules | — | Core library: text-to-SQL, semantic cache, nutrition labeling utilities |
 | `data/` | 0 (gitignored) | ~8 CSVs, 2 text/SQL, 3 PDFs | Data assets |
-| `database/` | 1 (`.gitkeep`) | `*.duckdb` files | Analytics DB |
+| `database/` | 1 (`.gitkeep`) | `*.duckdb` files, `semantic_query_cache/embedding_index.faiss`, `semantic_query_cache/indexed_queries.jsonl` | Analytics DB and local semantic cache artifacts |
 | `notebooks/` | 3 | — | EDA |
 | `docs/` | 6+ | — | Documentation |
 | `outputs/` | 0 (gitignored) | `*.json` traces | LLM traces |
@@ -368,7 +430,7 @@ flowchart TD
 1. Selective Patch from the DB ( Avoid Select * type statements)
 2. Add Logging for the Codebase (INFO, ERROR, CRITICAL levels)
   Ex: LLM Generated Query, SQL Results in INFO 
-3. Need Sample Queries - Query, SQL, Natural Language Answer (Tonality, Formatting). [>50]
+3. Expand semantic cache seed coverage: query, intent, SQL, SQL result, natural-language answer. Target >50 representative questions.
 
 
 

@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 
+import yaml
 from dotenv import load_dotenv
 
 # ── Project root & path setup ───────────────────────────────────────────
@@ -11,19 +12,32 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.text_sql.config import get_nutrition_settings
+
 load_dotenv()
 
-# ── Paths ───────────────────────────────────────────────────────────────
-_db_env = os.getenv("DB_PATH", "database/nutrition_data_filtered.duckdb")
-_db_p = Path(_db_env)
-DEFAULT_DB_PATH = _db_p if _db_p.is_absolute() else (ROOT / _db_p)
-VERIFIED_SQL_PATH = ROOT / "data" / "queries " / "queries_verified.sql"
-DEFAULT_OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs"))
+# ── Nutrition engine defaults (YAML + env) ─────────────────────────────
+_sql_settings = get_nutrition_settings(None)
 
-# ── SQL / model settings ────────────────────────────────────────────────
-DEFAULT_MODEL = os.getenv("MODEL_NAME", "gpt-5-mini")
+_db_env = os.getenv("DB_PATH")
+if _db_env:
+    _db_p = Path(_db_env)
+    DEFAULT_DB_PATH = _db_p if _db_p.is_absolute() else (ROOT / _db_p).resolve()
+else:
+    DEFAULT_DB_PATH = _sql_settings.database_ui_default_path
+
+VERIFIED_SQL_PATH = _sql_settings.verified_sql_path
+_out_env = os.getenv("OUTPUT_DIR")
+if _out_env:
+    _op = Path(_out_env)
+    DEFAULT_OUTPUT_DIR = _op.resolve() if _op.is_absolute() else (ROOT / _op).resolve()
+else:
+    DEFAULT_OUTPUT_DIR = _sql_settings.output_dir
+
+# ── SQL / model settings ───────────────────────────────────────────────
+DEFAULT_MODEL = os.getenv("MODEL_NAME", _sql_settings.llm_model)
 DEFAULT_TOP_K = int(os.getenv("TOP_K", "5"))
-DEFAULT_TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
+DEFAULT_TEMPERATURE = float(os.getenv("TEMPERATURE", str(_sql_settings.llm_temperature)))
 DEFAULT_TABLE_ROW_LIMIT = 10
 
 REPHRASE_MODEL = os.getenv("REPHRASE_MODEL_NAME", "gpt-4o-mini")
@@ -39,147 +53,44 @@ QUEUE_CONCURRENCY = int(os.getenv("GRADIO_QUEUE_CONCURRENCY", "2"))
 QUEUE_MAX_SIZE = int(os.getenv("GRADIO_QUEUE_MAX_SIZE", "32"))
 WARMUP_ON_START = os.getenv("WARMUP_ON_START", "true").lower() == "true"
 
-# ── UI content ──────────────────────────────────────────────────────────
-SAMPLE_QUERIES = [
-    "What is the overall SAM prevalence in March 2024?",
-    "Which 5 districts have the highest stunting rates in April 2024?",
-    "What is the total number of underweight children in February 2024?",
-    "Compare wasting rates between male and female children in March 2024",
-    "How has the SAM count changed from February to April 2024?",
-    "What percentage of children are stunted in Lucknow district?",
-]
+# ── Semantic query cache (FAISS + JSONL corpus) ─────────────────────────
+_sem_cache_enabled = os.getenv("SEMANTIC_QUERY_CACHE_ENABLED", "false").lower() == "true"
+_sem_cache_dir_env = os.getenv("SEMANTIC_QUERY_CACHE_DIRECTORY")
+if _sem_cache_dir_env:
+    _scd = Path(_sem_cache_dir_env)
+    SEMANTIC_QUERY_CACHE_DIRECTORY = _scd if _scd.is_absolute() else (ROOT / _scd).resolve()
+else:
+    SEMANTIC_QUERY_CACHE_DIRECTORY = (ROOT / "database" / "semantic_query_cache").resolve()
 
-SAMPLE_QUERY_LABELS = [
-    "SAM Prevalence (Mar 2024)",
-    "Top Stunted Districts (Apr 2024)",
-    "Underweight Count (Feb 2024)",
-    "Wasting by Gender (Mar 2024)",
-    "SAM Trend (Feb → Apr)",
-    "Stunting in Lucknow",
-]
+SEMANTIC_QUERY_CACHE_ENABLED = _sem_cache_enabled
+SEMANTIC_QUERY_CACHE_MIN_SIMILARITY = float(os.getenv("SEMANTIC_QUERY_CACHE_MIN_SIMILARITY", "0.95"))
+SEMANTIC_QUERY_CACHE_EMBEDDING_MODEL = os.getenv(
+    "SEMANTIC_QUERY_CACHE_EMBEDDING_MODEL",
+    "sentence-transformers/all-MiniLM-L6-v2",
+)
+SEMANTIC_QUERY_CACHE_REEXECUTE_ON_HIT = (
+    os.getenv("SEMANTIC_QUERY_CACHE_REEXECUTE_ON_HIT", "false").lower() == "true"
+)
 
-TIPS_MD = """
-### About this system
-Ask natural-language questions about child nutrition data from **Uttar Pradesh, India**.
-The system translates your question into SQL and queries the database automatically.
 
----
+def _load_gradio_ui_bundle() -> tuple[list[str], list[str], str, str]:
+    ui_path = ROOT / "configs" / "gradio_ui.yaml"
+    data = yaml.safe_load(ui_path.read_text(encoding="utf-8")) or {}
+    rel = data.get("sample_queries_relative_path", "configs/gradio_sample_queries.yaml")
+    sample_path = (ROOT / rel).resolve() if not Path(rel).is_absolute() else Path(rel)
+    samples_doc = yaml.safe_load(sample_path.read_text(encoding="utf-8")) or {}
+    items = samples_doc.get("sample_query_items") or []
+    queries: list[str] = []
+    labels: list[str] = []
+    for it in items:
+        q = str(it.get("query", "")).strip()
+        if not q:
+            continue
+        queries.append(q)
+        labels.append(str(it.get("label", "")).strip())
+    tips = str(data.get("tips_md") or "")
+    css = str(data.get("app_css") or "")
+    return queries, labels, tips, css
 
-### Data at a glance
-| | |
-|---|---|
-| **Children** | ~3.6 million |
-| **Districts** | 75 UP districts |
-| **Months** | February, March, April 2024 |
-| **Age group** | 0 – 6 years |
-| **Programme** | ICDS (Anganwadi centres) |
 
----
-
-### Indicators — quick glossary
-| Term | What it means |
-|---|---|
-| **Stunting** | Low height-for-age (chronic undernutrition) |
-| **Wasting** | Low weight-for-height (acute undernutrition) |
-| **Underweight** | Low weight-for-age (combined indicator) |
-| **SAM** | Severe Acute Malnutrition |
-| **MAM** | Moderate Acute Malnutrition |
-
----
-
-### Query patterns that work well
-
-**Prevalence / rates**
-> "What is the SAM prevalence in March 2024?"
-> "What percentage of children are stunted in April 2024?"
-
-**District comparisons**
-> "Which 10 districts have the highest wasting rates in February 2024?"
-> "Compare stunting rates across all districts in March 2024."
-
-**Gender breakdown**
-> "Compare SAM rates between male and female children."
-> "What is the underweight rate for girls in April 2024?"
-
-**Trends over time**
-> "How has the SAM count changed from February to April 2024?"
-> "Show the monthly stunting rate for Agra district across all three months."
-
-**Counts vs. percentages**
-> "How many children are severely malnourished in Lucknow?"
-> "What fraction of children in Varanasi are underweight?"
-
-**Filters & combinations**
-> "What is the SAM rate in rural AWCs of Gorakhpur district in March 2024?"
-
----
-
-### Tips for best results
-- **Specify the month** — the data covers Feb, Mar and Apr 2024. Queries that don't mention a month may aggregate all three or default to one.
-- **Use district names exactly** — e.g. "Lucknow", "Varanasi", "Agra", "Gorakhpur". Partial names may not match.
-- **Ask one question at a time** — compound questions ("...and also compare with...") can confuse the SQL generator. Break them up.
-- **If a result looks wrong, rephrase** — try being more specific, e.g. add "as a percentage" or "count of children".
-- **Scalar answers appear as large numbers** in the chat; tabular answers show the first 5 rows inline with the full table in the Results panel.
-"""
-
-APP_CSS = """
-/* ── Remove default max-width constraint ───────────────────────────── */
-.gradio-container {
-    max-width: 100% !important;
-    padding: 0 10px 8px 10px !important;
-}
-
-/* ── Slim app header ────────────────────────────────────────────────── */
-#app-header {
-    padding: 10px 2px 8px 2px !important;
-    border-bottom: 1px solid #e2e8f0;
-    margin-bottom: 8px !important;
-    align-items: center !important;
-    gap: 8px !important;
-}
-#app-title p {
-    margin: 0 !important;
-    font-size: 13.5px !important;
-    color: #64748b !important;
-    font-weight: 400 !important;
-}
-#app-title strong { color: #1e293b !important; font-weight: 600 !important; }
-#panel-toggle-btn {
-    height: 30px !important;
-    min-width: 110px !important;
-    font-size: 12.5px !important;
-    border-radius: 6px !important;
-}
-
-/* ── Side panel ─────────────────────────────────────────────────────── */
-#side-col {
-    border-left: 1px solid #e2e8f0 !important;
-    padding-left: 10px !important;
-    overflow-y: auto;
-}
-
-/* ── Chat markdown tables — blue palette ───────────────────────────── */
-.message-wrap table {
-    border-collapse: collapse;
-    width: 100%;
-    font-size: 12.5px;
-    margin-top: 10px;
-    border-radius: 4px;
-    overflow: hidden;
-}
-.message-wrap table th {
-    background: #eff6ff;
-    border: 1px solid #bfdbfe;
-    padding: 6px 10px;
-    text-align: left;
-    font-weight: 600;
-    color: #1e40af;
-}
-.message-wrap table td {
-    border: 1px solid #dbeafe;
-    padding: 5px 10px;
-    vertical-align: top;
-    color: #374151;
-}
-.message-wrap table tr:nth-child(even) td { background: #f8faff; }
-"""
+SAMPLE_QUERIES, SAMPLE_QUERY_LABELS, TIPS_MD, APP_CSS = _load_gradio_ui_bundle()

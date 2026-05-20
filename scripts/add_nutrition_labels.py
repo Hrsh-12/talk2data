@@ -2,7 +2,7 @@
 """
 Add month-wise nutrition labels to cleaned_dataset.csv.
 
-Uses src/nutrition_labels.py lookup logic and writes a new CSV with columns:
+Uses src/utils/nutrition_labels.py lookup logic and writes a new CSV with columns:
 - {month}_stunting_status, {month}_is_stunted
 - {month}_underweight_status, {month}_is_underweight
 - {month}_wasting_status, {month}_is_wasted, {month}_is_sam
@@ -25,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from src.nutrition_labels import classify_all  # noqa: E402
+from src.utils.nutrition_labels import classify_all  # noqa: E402
 
 
 MONTH_CONFIG = {

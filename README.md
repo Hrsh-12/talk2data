@@ -30,7 +30,7 @@ data/cleaned_dataset_with_labels.csv
 database/nutrition_data_filtered.duckdb (table: nutrition_data)
    │
    ├── scripts/llm_to_sql.py (single or batch CLI)
-   ├── src/nutrition_sql/service.py (shared query service)
+   ├── src/text_sql/service/ (shared query façade; engine under src/text_sql/engine/)
    ├── apps/gradio_app.py (interactive chat UI)
    ▼
 outputs/llm_to_sql_trace_*.json|.md

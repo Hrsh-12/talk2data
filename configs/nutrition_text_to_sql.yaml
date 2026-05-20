@@ -1,0 +1,32 @@
+# Text-to-SQL engine defaults (paths relative to project root unless absolute).
+project_root: .
+
+database:
+  # CLI / `llm_to_sql.py` default when `--db` is omitted (matches prior script default).
+  default_relative_path: database/nutrition_data.duckdb
+  # Gradio when `DB_PATH` env is unset (matches prior `apps/config.py` default).
+  ui_default_relative_path: database/nutrition_data_filtered.duckdb
+
+schema:
+  tables:
+    - nutrition_data
+  sample_rows_limit: 3
+  # null = SELECT * for ICL samples only (not execution SQL).
+  sample_rows_columns: null
+
+prompts:
+  system_template_relative_path: configs/prompts/nutrition_system.md
+
+llm:
+  model: gpt-5-mini
+  temperature: 0.0
+  repair_enabled: true
+
+evaluation:
+  abs_tolerance: 1.0e-9
+  rel_tolerance: 1.0e-9
+
+paths:
+  verified_sql_relative_path: data/queries /queries_verified.sql
+  queries_txt_relative_path: data/queries /queries.txt
+  output_dir_relative_path: outputs

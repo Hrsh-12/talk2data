@@ -1,246 +1,119 @@
-# Codebase.md — Structural Design
+# Codebase.md — Layout and responsibilities
 
-## 1. High-Level Architecture
+Monolith pipeline: scripts and notebooks produce data and DuckDB; [`src/text_sql/`](../src/text_sql/) implements NL→SQL plus the semantic query cache; [`apps/`](../apps/) is the Gradio UI. No separate API service.
 
-**Pattern: Modular Monolith (Script-Orchestrated Data Pipeline)**
+## Repository directories
 
-The codebase follows a **pipeline-oriented monolith** architecture. There is no service mesh, no API gateway, and no microservice boundary. Instead, a chain of standalone Python scripts transforms raw data through successive stages, culminating in an embedded analytics database queried via an LLM-powered UI.
+| Directory | What it is for |
+|-----------|----------------|
+| [`data/`](../data/) | Raw and derived CSVs, PDFs, lookup tables, benchmark questions (often gitignored locally; must be provisioned). |
+| [`configs/`](../configs/) | Versioned defaults: engine YAML, prompt markdown, Gradio UI copy, sample queries, and intent-classification prompt. |
+| [`scripts/`](../scripts/) | CLI stages: PDF → lookups, label CSV, build DuckDB, batch LLM→SQL, build semantic query index. |
+| [`src/`](../src/) | Importable code: [`text_sql/`](../src/text_sql/) (NL→SQL) and [`utils/`](../src/utils/) (WHO labeling + small CSV helpers). |
+| [`database/`](../database/) | DuckDB file(s) produced by `build_nutrition_db.py`; semantic cache artifacts under `semantic_query_cache/`; artifacts usually gitignored. |
+| [`apps/`](../apps/) | Gradio entrypoint, UI config loader, result formatting and rephrase helpers. |
+| [`notebooks/`](../notebooks/) | Interactive EDA, cleaning, and DB validation. |
+| [`docs/`](../docs/) | Design and status notes (this file, `ProjectStatus.md`, etc.). |
+| [`outputs/`](../outputs/) | JSON traces from CLI/UI runs (gitignored). |
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Repository Layout                           │
-│                                                                     │
-│  data/          Static assets: raw CSVs, PDF-derived lookups        │
-│  scripts/       Sequential ETL scripts (parse → label → build → Q) │
-│  src/           Reusable library code (labels engine, SQL service)  │
-│  database/      Runtime artifact: DuckDB file (gitignored)          │
-│  apps/          Gradio web UI (single entry point)                  │
-│  notebooks/     Exploratory analysis (EDA, validation)              │
-│  docs/          Project documentation                               │
-│  outputs/       LLM trace artifacts (gitignored)                    │
-└─────────────────────────────────────────────────────────────────────┘
-```
+## `src/text_sql/` — text-to-SQL stack
 
-Key architectural traits:
+The engine wires **grounding → prompt → LLM → extract SQL → execute (read-only) → optional repair**. Public entry points live on [`service/`](../src/text_sql/service/) and are re-exported from [`__init__.py`](../src/text_sql/__init__.py).
 
-| Trait | Description |
-|-------|-------------|
-| **Embedded DB** | DuckDB (single file, no server process) serves as the analytics store. |
-| **LLM-in-the-loop** | OpenAI models generate SQL at runtime; a repair loop retries on failure. |
-| **No service layer** | No REST/gRPC API between components; Gradio calls `src/` functions directly. |
-| **No container/CI** | No Dockerfile, docker-compose, Makefile, or CI/CD pipeline configuration. |
-| **Script orchestration** | Pipeline stages are run manually via `python scripts/*.py` in sequence. |
+### Subpackages (by function)
 
----
+| Path | Function |
+|------|----------|
+| [`config/`](../src/text_sql/config/) | Load [`configs/nutrition_text_to_sql.yaml`](../configs/nutrition_text_to_sql.yaml); merge env overrides; expose `NutriSqlSettings` and path helpers. |
+| [`grounding/`](../src/text_sql/grounding/) | Build cached DuckDB table DDL + a few sample rows for the system prompt (ICL). |
+| [`sql/`](../src/text_sql/sql/) | Parse SQL from model text; enforce read-only execution via LangChain `SQLDatabase`; optional direct DuckDB → DataFrame for the UI. |
+| [`results/`](../src/text_sql/results/) | Parse stringified query results for display and for downstream LLM rephrase. |
+| [`eval/`](../src/text_sql/eval/) | Parse verified benchmark SQL and compare executed results to golden outputs. |
+| [`engine/`](../src/text_sql/engine/) | `TextToSQLEngine`: orchestrates the full NL→SQL loop including one repair attempt. |
+| [`service/`](../src/text_sql/service/) | Stable façade: `run_single_question`, `warmup_runtime`, trace JSON I/O, `read_queries_file`. |
+| [`prompts/`](../src/text_sql/prompts/) | Re-exports prompt-builder types (thin namespace over adapters). |
+| [`llm/`](../src/text_sql/llm/) | Re-exports chat-client helpers (thin namespace over adapters). |
+| [`semantic_cache/`](../src/text_sql/semantic_cache/) | FAISS-backed semantic lookup over previously answered questions; stores vectors in `embedding_index.faiss` and aligned `IndexedQuery` records in `indexed_queries.jsonl`. |
 
-## 2. Component Breakdown
+### What `adapters/` means
 
-### 2.1 `data/` — Static Data Assets
+**Adapters** are the [adapter pattern](https://en.wikipedia.org/wiki/Adapter_pattern): small **interfaces (ABCs)** for “schema context”, “prompt builder”, “LLM”, and “SQL executor”, plus **concrete classes** that plug in **LangChain + OpenAI + DuckDB** today. The engine depends on those interfaces, not on Gradio or script CLIs, so you could swap implementations (e.g. another model client or executor) without rewriting the pipeline. Code lives in [`adapters/providers.py`](../src/text_sql/adapters/providers.py).
 
-| Subdirectory / File | Responsibility |
-|----------------------|----------------|
-| `3_months_UP_0m_6y_data*.csv` | Raw ICDS-style child health extracts for Uttar Pradesh (0–6y, Feb–Apr 2024). ~18.3M rows, 23–29 columns. |
-| `cleaned_dataset.csv` | Post-cleaning subset (~3.64M rows): Hb columns dropped, null birth metrics filtered. |
-| `cleaned_dataset_with_labels.csv` | Analytics-ready table with 24 additional nutrition label columns. |
-| `cleaned_dataset_with_labels_filtered.csv` | Stricter-filtered labeled subset (~3.45M rows). |
-| `district_mapping.csv` | Reference: `district_name` ↔ `district_id` for 75 UP districts. |
-| `processed/stunting_lookup.csv` | Height-for-age thresholds by (sex, day). 4,444 rows. |
-| `processed/underweight_lookup.csv` | Weight-for-age thresholds by (sex, day). 4,444 rows. |
-| `processed/wasting_lookup.csv` | Weight-for-height thresholds by (sex, age_band, height_cm). 1,300 rows. |
-| `queries/queries.txt` | 28 natural-language benchmark questions. |
-| `queries/queries_verified.sql` | Reference SQL + expected results for benchmarking. |
+## `src/utils/` — labeling and small helpers
 
-**Interaction:** `data/` is read by `scripts/` and `src/nutrition_labels.py`. It is gitignored (broad `data/` rule), so these files must be provisioned locally.
+| Path | Function |
+|------|----------|
+| [`nutrition_labels.py`](../src/utils/nutrition_labels.py) | WHO-style thresholds from lookup CSVs; `classify_all(...)` for stunting / underweight / wasting / SAM. |
+| [`csv_utils.py`](../src/utils/csv_utils.py) | `load_csv` / `summarize` for notebooks (optional; also re-exported from [`__init__.py`](../src/utils/__init__.py)). |
 
-### 2.2 `scripts/` — ETL Pipeline Scripts
+Import examples: `from src.utils.nutrition_labels import classify_all` or `from src.utils import classify_all`.
 
-| Script | Stage | Input | Output |
-|--------|-------|-------|--------|
-| `parse_assessment_pdfs.py` | 1 | `data/*.pdf` (3 WHO-style PDFs) | `data/processed/*_lookup.csv` |
-| `add_nutrition_labels.py` | 2 | `data/cleaned_dataset.csv` + lookups | `data/cleaned_dataset_with_labels.csv` |
-| `build_nutrition_db.py` | 3 | Labeled CSV | `database/*.duckdb` (Gradio default: `nutrition_data_filtered.duckdb`) |
-| `llm_to_sql.py` | 4 | DuckDB + NL question(s) | Console output + `outputs/*.json` |
+## Main scripts (order of pipeline)
 
-**Interaction:** Scripts are stateless CLI tools. Each reads its predecessor's output. `add_nutrition_labels.py` imports from `src/nutrition_labels`. `llm_to_sql.py` imports from `src/nutrition_sql/service`.
+| Script | Role |
+|--------|------|
+| `parse_assessment_pdfs.py` | PDF text → processed lookup CSVs. |
+| `add_nutrition_labels.py` | Cleaned CSV + lookups → labeled CSV (uses `src.utils.nutrition_labels`). |
+| `build_nutrition_db.py` | Labeled CSV → DuckDB table `nutrition_data`. |
+| `llm_to_sql.py` | NL questions → generated SQL and traces; optional `--config` for YAML path. |
+| `build_semantic_query_index.py` | Batch-generate cached query answers and build FAISS + JSONL semantic query artifacts. |
 
-### 2.3 `src/` — Core Library
+## DuckDB model (summary)
 
-```
-src/
-├── __init__.py               # Empty package marker
-├── utils.py                  # CSV load/summarize helpers (currently unused)
-├── nutrition_labels.py       # WHO-style classification engine
-└── nutrition_sql/
-    ├── __init__.py           # Re-exports public API
-    └── service.py            # LLM→SQL generation, execution, repair, comparison
-```
+Single wide table **`nutrition_data`**: one row per child (`beneficiary_id`); admin columns including `district_name`; three month prefixes `feb24_`, `mar24_`, `apr24_` for measurements and derived label columns (`*_status`, `*_is_*`). Schema comes from the CSV load, not checked-in DDL.
 
-| Module | Responsibility |
-|--------|----------------|
-| `nutrition_labels.py` | Loads `data/processed/*_lookup.csv` into lazy-cached dicts. Exposes `classify_all(sex, age_days, height_cm, weight_kg) → dict` for stunting/underweight/wasting/SAM status. |
-| `nutrition_sql/service.py` | Manages the full NL→SQL lifecycle: prompt construction from DuckDB schema, LLM invocation via LangChain `ChatOpenAI`, SQL extraction/normalization, read-only enforcement, execution via `SQLDatabase`, one-shot SQL repair on failure, and verified-SQL comparison for benchmarking. |
-| `utils.py` | Thin `pandas` wrappers (`load_csv`, `summarize`). Not imported by any other module — effectively dead code. |
+## Stack (essentials)
 
-**Internal coupling:** Zero. `nutrition_labels` and `nutrition_sql` do not import each other. Orchestration happens in `scripts/` and `apps/`.
+Python 3.10+, DuckDB, pandas, LangChain + `langchain-openai`, `duckdb-engine` + SQLAlchemy &lt; 2, Gradio, PyPDF2, PyYAML, `python-dotenv`, NumPy, FAISS CPU, `sentence-transformers`. Secrets: `OPENAI_API_KEY` in `.env`.
 
-### 2.4 `database/` — DuckDB Runtime Store
+## Run Gradio
 
-Contains only a `.gitkeep` placeholder. DuckDB files (for example `nutrition_data_filtered.duckdb`, the Gradio default) are generated by `build_nutrition_db.py` and gitignored. The DB holds a single wide table (`nutrition_data`) with ~46 columns and ~3.4M rows in the filtered export.
+From the repository root, with `OPENAI_API_KEY` and a DuckDB in place (see [`README.md`](../README.md)):
 
-### 2.5 `apps/` — Gradio Web Interface
-
-Single file: `gradio_app.py` (586 lines). Builds a **Gradio Blocks** chat-first UI:
-
-| UI Element | Function |
-|------------|----------|
-| `ChatInterface` | Accepts NL questions, calls `run_single_question()` from `src/nutrition_sql/service`. |
-| Results tab | Displays `gr.Dataframe` + `gr.Markdown` summary of SQL results. |
-| Ground truth section | Renders parsed Q&A from `queries_verified.sql` as a reference table. |
-| LLM rephrase | Uses a secondary `ChatOpenAI` (`gpt-4o-mini`) to rephrase raw SQL results into natural language. |
-
-**Interaction:** Imports `run_single_question`, `save_single_trace`, `warmup_runtime` from `src.nutrition_sql.service`. Connects to DuckDB at `DB_PATH` (default: `database/nutrition_data_filtered.duckdb`).
-
-### 2.6 `notebooks/` — Exploratory Analysis
-
-| Notebook | Purpose | Connects to |
-|----------|---------|-------------|
-| `01_initial_exploration.ipynb` | Heavy EDA on raw CSV: chunked profiling, missingness, cleaning, label generation. | `data/`, `src/nutrition_labels` |
-| `01_explore.ipynb` | Schema inspection of normalized DuckDB (`child_health.duckdb` — legacy). | `database/` |
-| `eda_processed_database.ipynb` | Validation of processed DuckDB (`nutrition_data_filtered.duckdb`). | `database/` |
-
-### 2.7 Component Interaction Diagram
-
-```mermaid
-flowchart TD
-    A[WHO Assessment PDFs] --> B[parse_assessment_pdfs.py]
-    B --> C[Lookup CSVs]
-    D[Raw CSVs — 18.3M rows] --> E[Manual Cleaning — Notebook]
-    E --> F[Cleaned CSV — 3.6M rows]
-    C --> G[add_nutrition_labels.py]
-    F --> G
-    G --> H[Labeled CSV — 46 cols]
-    H --> I[build_nutrition_db.py]
-    I --> J[(DuckDB — nutrition_data)]
-    J --> K[nutrition_sql/service.py]
-    L[OpenAI API] <--> K
-    K --> M[llm_to_sql.py — CLI]
-    K --> N[Gradio Chat UI]
-    L <--> N
+```bash
+python apps/gradio_app.py
 ```
 
----
+To enable semantic query caching in Gradio, first build the local artifacts:
 
-## 3. Data Schema
+```bash
+python scripts/build_semantic_query_index.py \
+  --queries-file data/queries/queries.txt \
+  --database database/nutrition_data_filtered.duckdb \
+  --output-directory database/semantic_query_cache
 
-### 3.1 Database Engine
+export SEMANTIC_QUERY_CACHE_ENABLED=true
+export SEMANTIC_QUERY_CACHE_DIRECTORY=database/semantic_query_cache
+python apps/gradio_app.py
+```
 
-**DuckDB** (embedded, serverless, single-file). Connected via:
-- Direct: `duckdb.connect(str(db_path))`
-- LangChain: `SQLDatabase.from_uri("duckdb:///{db_path}")`
-
-### 3.2 Table: `nutrition_data`
-
-A single denormalized wide table. Schema is inferred at load time via `CREATE TABLE AS SELECT * FROM <registered DataFrame>`. No explicit DDL, constraints, indices, views, or stored procedures.
-
-#### Column Groups
-
-| Group | Columns | Type | Notes |
-|-------|---------|------|-------|
-| **Identity** | `beneficiary_id` | VARCHAR/INT | Row-level grain: one row per child |
-| **Demographics** | `dob`, `gender` | DATE/VARCHAR | Date of birth, M/F |
-| **Birth metrics** | `birth_height`, `birth_weight` | FLOAT | Non-null filter applied during cleaning |
-| **Admin hierarchy** | `state_id`, `district_name`, `project_id`, `sector_id`, `awc_id`, `awc_code` | INT/VARCHAR | `district_name` in the Gradio default DB (`nutrition_data_filtered.duckdb`); CSV→DuckDB builds may start with `district_id` until mapped |
-| **Monthly measurements** (×3) | `{month}_status`, `{month}_height`, `{month}_weight`, `{month}_height_weight_entered_date` | VARCHAR/FLOAT/DATE | For `feb24`, `mar24`, `apr24` |
-| **Monthly labels** (×3) | `{month}_stunting_status`, `{month}_is_stunted`, `{month}_underweight_status`, `{month}_is_underweight`, `{month}_wasting_status`, `{month}_is_wasted`, `{month}_is_sam` | VARCHAR/INT(0/1) | WHO-derived classification labels |
-
-**Total columns:** ~46 (22 base + 24 label columns).
-**Total rows:** ~3.6M (full `cleaned_dataset_with_labels.csv`); ~3.45M in `nutrition_data_filtered.duckdb`.
-
-### 3.3 Data Flow: Database Layer → src/ Logic
+## Pipeline overview
 
 ```mermaid
 flowchart LR
-    A[Labeled CSV] --> B[build_nutrition_db.py]
-    B --> C[(DuckDB)]
-    C --> D[service.py]
-    D --> E[LLM Prompt]
-    E --> F[OpenAI — Generate SQL]
-    F --> G[Execute SQL]
-    G --> H{Success?}
-    H -- Yes --> I[Query Result]
-    H -- No --> J[Repair SQL via LLM]
-    J --> G
+  subgraph inputs [Inputs]
+    PDFs[PDFs]
+    Raw[Raw CSV]
+  end
+  subgraph etl [ETL scripts]
+    S1[parse PDFs]
+    S2[add labels]
+    S3[build DuckDB]
+  end
+  subgraph q [Query]
+    E[text_sql engine]
+    C[semantic query cache]
+    API[OpenAI]
+  end
+  PDFs --> S1
+  Raw --> S2
+  S1 --> S2
+  S2 --> S3
+  S3 --> E
+  S3 --> C
+  API <--> E
+  API --> C
+  C --> UI
+  E --> CLI[llm_to_sql CLI]
+  E --> UI[Gradio apps]
 ```
-
-Key points:
-- Schema introspection (`get_table_info`) happens once at startup and is `@lru_cache`d.
-- Sample rows (3 rows) are embedded in every LLM prompt for grounding.
-- Bool-like label columns (`*_is_*`) are normalized to `0`/`1` integers during DB build for clean aggregation.
-
----
-
-## 4. Technical Stack
-
-### 4.1 Core Languages & Runtime
-
-| Technology | Version Constraint | Role |
-|------------|--------------------|------|
-| Python | 3.10+ (union type hints used) | All code |
-| DuckDB | ≥ 0.9.0 | Embedded analytics database |
-| pandas | ≥ 2.0.0 | Data loading, transformation, display |
-
-### 4.2 LLM / AI Stack
-
-| Technology | Version Constraint | Role |
-|------------|--------------------|------|
-| OpenAI API | via `langchain-openai ≥ 1.1.0` | SQL generation (`gpt-5-mini`), result rephrasing (`gpt-4o-mini`) |
-| LangChain | ≥ 1.0.0 | LLM orchestration, `SQLDatabase` wrapper |
-| LangChain Community | ≥ 0.4.0 | `SQLDatabase` utility |
-
-### 4.3 Web / UI
-
-| Technology | Version Constraint | Role |
-|------------|--------------------|------|
-| Gradio | ≥ 5.0.0 | Chat UI with `Blocks`, `ChatInterface`, `Dataframe` |
-
-### 4.4 Data Processing
-
-| Technology | Version Constraint | Role |
-|------------|--------------------|------|
-| PyPDF2 | ≥ 3.0.0 | PDF text extraction for lookup tables |
-| SQLAlchemy | < 2 | Required by `duckdb-engine` for LangChain `SQLDatabase` |
-| duckdb-engine | ≥ 0.17.0 | SQLAlchemy dialect for DuckDB |
-| python-dotenv | ≥ 1.0.0 | `.env` file loading |
-
-### 4.5 Unlisted but Used
-
-| Package | Used By | Notes |
-|---------|---------|-------|
-| `tqdm` | `add_nutrition_labels.py`, `01_initial_exploration.ipynb` | Progress bars; **missing from `requirements.txt`** |
-| `matplotlib`, `seaborn` | `01_initial_exploration.ipynb` | Notebook-only visualization |
-| `numpy` | `01_initial_exploration.ipynb` | Notebook-only |
-
-### 4.6 External Services
-
-| Service | Authentication | Usage |
-|---------|---------------|-------|
-| **OpenAI API** | `OPENAI_API_KEY` in `.env` | SQL generation and natural-language result rephrasing |
-
----
-
-## 5. Inconsistencies & Deviations from Best Practices
-
-| # | Issue | Severity | Detail |
-|---|-------|----------|--------|
-| 1 | **No tests** | High | Zero unit/integration/e2e tests anywhere in the repo. No `tests/` directory, no pytest config. |
-| 2 | **No CI/CD** | High | No GitHub Actions, GitLab CI, or any automation pipeline. |
-| 3 | **No containerization** | Medium | No Dockerfile or docker-compose. Deployment relies on manual conda/pip setup. |
-| 4 | **No formal packaging** | Medium | No `pyproject.toml` or `setup.py`. The project cannot be `pip install`ed. `sys.path` hacks are used instead. |
-| 5 | **Broad `.gitignore`** | Medium | `data/` and `database/` are fully gitignored. Essential reference files (lookups, mapping, queries) are excluded from version control. |
-| 6 | **Missing dependency** | Low | `tqdm` is used but not listed in `requirements.txt`. |
-| 7 | **Dead code** | Low | `src/utils.py` is not imported anywhere. `prefer_verified_templates` parameter is a documented no-op. |
-| 8 | **Space in directory name** | Low | `data/queries /` contains a trailing space — fragile on some filesystems and shells. |
-| 9 | **No logging** | Medium | All output is via `print()`. No structured logging framework. |
-| 10 | **Global mutable state** | Low | `nutrition_labels.py` uses module-level mutable globals for lazy caching instead of a proper cache or singleton pattern. |
-| 11 | **Schema drift risk** | Medium | DB schema is inferred from CSV at build time (`CREATE TABLE AS SELECT *`). No explicit DDL or migration history. |
-| 12 | **Doc vs. code mismatch** | Low | `docs/PROJECT.md` describes a normalized multi-table design that was never implemented. Only the flat `nutrition_data` table exists. |

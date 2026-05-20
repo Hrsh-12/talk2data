@@ -14,6 +14,8 @@ import duckdb
 import pandas as pd
 from langchain_openai import ChatOpenAI
 
+from src.text_sql.results import parse_exec_output
+from src.text_sql.sql import is_read_only_sql
 from config import (
     DEFAULT_DB_PATH,
     REPHRASE_MAX_RETRIES,
@@ -189,27 +191,9 @@ def ground_truth_html(path: Path) -> str:
 
 # ── SQL output parsing ──────────────────────────────────────────────────
 
-def _parse_exec_output(raw_output: object) -> tuple[str, object]:
-    if isinstance(raw_output, (list, dict, tuple)):
-        return str(raw_output).strip(), raw_output
-
-    text = str(raw_output).strip()
-    if not text or text == "None":
-        return "", ""
-    try:
-        return text, ast.literal_eval(text)
-    except (ValueError, SyntaxError):
-        return text, text
-
-
-def _is_read_only_sql(sql: str) -> bool:
-    normalized = sql.strip().lower().lstrip("(")
-    return normalized.startswith("select") or normalized.startswith("with")
-
-
 def _columns_for_sql(db_path: Path, sql: str) -> list[str] | None:
     cleaned = sql.strip()
-    if not cleaned or not _is_read_only_sql(cleaned):
+    if not cleaned or not is_read_only_sql(cleaned):
         return None
     wrapped = f"SELECT * FROM ({cleaned.rstrip(';')}) AS q LIMIT 0;"
     try:
@@ -239,7 +223,7 @@ def build_result_table(
         err = str(exec_payload.get("error") or "Unknown SQL error.")
         return pd.DataFrame({"error": [err]}), f"### Result\n\n`ERROR:` {err}"
 
-    text, parsed = _parse_exec_output(exec_payload.get("raw_output"))
+    text, parsed = parse_exec_output(exec_payload.get("raw_output"))
     if not text:
         return pd.DataFrame(), "### Result\n\nNo rows returned."
 
@@ -313,7 +297,7 @@ def _chat_llm(
 
 
 def _build_rephrase_payload(exec_payload: dict, max_rows: int = 20) -> dict:
-    text, parsed = _parse_exec_output(exec_payload.get("raw_output"))
+    text, parsed = parse_exec_output(exec_payload.get("raw_output"))
     if not text:
         return {"status": "empty", "preview": []}
 
@@ -342,7 +326,7 @@ def _fallback_reply(question: str, exec_payload: dict) -> str:
         err = str(exec_payload.get("error") or "Unknown SQL error.")
         return f"I could not complete that query because SQL execution failed: {err}"
 
-    text, parsed = _parse_exec_output(exec_payload.get("raw_output"))
+    text, parsed = parse_exec_output(exec_payload.get("raw_output"))
     if not text:
         return "I ran the SQL successfully, but it returned no rows for your question."
     if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], tuple) and len(parsed[0]) == 1:
