@@ -20,12 +20,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.text_sql.config import get_nutrition_settings
-from src.text_sql.service import (
+from src.text_sql.engine import TextToSQLEngine
+from src.text_sql.eval import (
     compare_generated_with_verified,
     parse_verified_sql_by_query,
+)
+from src.text_sql.utils import (
+    get_nutrition_settings,
     read_queries_file,
-    run_single_question,
     save_batch_outputs,
 )
 
@@ -48,8 +50,6 @@ def main() -> int:
         help="Path to nutrition_text_to_sql.yaml (default: configs/nutrition_text_to_sql.yaml under repo root)",
     )
     parser.add_argument("--db", default=None, help="Path to DuckDB file (default from config YAML)")
-    parser.add_argument("--model", default=None, help="OpenAI-compatible chat model (default from config / env)")
-    parser.add_argument("--temperature", type=float, default=None, help="LLM temperature")
     parser.add_argument("--top-k", type=int, default=5, help="Preferred max rows in response")
     parser.add_argument("--output-dir", default=None, help="Directory for saved batch trace files")
     parser.add_argument(
@@ -69,8 +69,7 @@ def main() -> int:
         if args.verified_sql_file
         else settings.verified_sql_path
     )
-    model = args.model if args.model is not None else settings.llm_model
-    temperature = settings.llm_temperature if args.temperature is None else float(args.temperature)
+    engine = TextToSQLEngine.from_config(cfg_path, db_path=db_path, top_k=args.top_k)
 
     if not args.queries_file and not args.question:
         print("Error: provide either a question or --queries-file")
@@ -78,8 +77,6 @@ def main() -> int:
     if args.queries_file and args.question:
         print("Error: use either a single question OR --queries-file, not both")
         return 1
-
-    config_kw = {"config_path": cfg_path} if cfg_path else {}
 
     try:
         if args.queries_file:
@@ -90,13 +87,8 @@ def main() -> int:
             results: list[dict] = []
             for i, query in enumerate(queries, start=1):
                 print(f"Running query {i}/{len(queries)}: {query}")
-                run_result = run_single_question(
+                run_result = engine.run_single_question(
                     question=query,
-                    db_path=db_path,
-                    model=model,
-                    temperature=temperature,
-                    top_k=args.top_k,
-                    **config_kw,
                 )
                 verified_sql_list = verified_sql_by_query.get(i, [])
                 comparison = compare_generated_with_verified(
@@ -132,13 +124,8 @@ def main() -> int:
 
         question = " ".join(args.question)
         print(f"Question: {question}\n")
-        run_result = run_single_question(
+        run_result = engine.run_single_question(
             question=question,
-            db_path=db_path,
-            model=model,
-            temperature=temperature,
-            top_k=args.top_k,
-            **config_kw,
         )
         print("Generated SQL:")
         print(run_result["generated_sql"])

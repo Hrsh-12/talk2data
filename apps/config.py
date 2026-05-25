@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.text_sql.config import get_nutrition_settings
+from src.text_sql.utils import get_nutrition_settings
 
 load_dotenv()
 
@@ -54,7 +54,7 @@ QUEUE_MAX_SIZE = int(os.getenv("GRADIO_QUEUE_MAX_SIZE", "32"))
 WARMUP_ON_START = os.getenv("WARMUP_ON_START", "true").lower() == "true"
 
 # ── Semantic query cache (FAISS + JSONL corpus) ─────────────────────────
-_sem_cache_enabled = os.getenv("SEMANTIC_QUERY_CACHE_ENABLED", "false").lower() == "true"
+_sem_cache_enabled = os.getenv("SEMANTIC_QUERY_CACHE_ENABLED", "true").lower() == "true"
 _sem_cache_dir_env = os.getenv("SEMANTIC_QUERY_CACHE_DIRECTORY")
 if _sem_cache_dir_env:
     _scd = Path(_sem_cache_dir_env)

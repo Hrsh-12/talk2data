@@ -7,8 +7,8 @@ to verified SQL, aggregates metrics, and writes a structured EvalReport JSON.
 Usage — full eval with benchmark tags:
   python scripts/run_eval.py
 
-Usage — override db / model:
-  python scripts/run_eval.py --db database/nutrition_data.duckdb --model gpt-4o
+Usage — override db:
+  python scripts/run_eval.py --db database/nutrition_data.duckdb
 
 Usage — use plain queries.txt without category tags:
   python scripts/run_eval.py --no-benchmark-tags
@@ -30,13 +30,15 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.text_sql.config import get_nutrition_settings
-from src.text_sql.eval import aggregate_verdicts
-from src.text_sql.service import (
+from src.text_sql.engine import TextToSQLEngine
+from src.text_sql.eval import (
+    aggregate_verdicts,
     compare_generated_with_verified,
     parse_verified_sql_by_query,
+)
+from src.text_sql.utils import (
+    get_nutrition_settings,
     read_queries_file,
-    run_single_question,
 )
 
 
@@ -203,17 +205,6 @@ def main() -> int:
         help="Path to DuckDB file (default from config)",
     )
     parser.add_argument(
-        "--model",
-        default=None,
-        help="OpenAI-compatible model name (default from config / env)",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=None,
-        help="LLM temperature (default from config)",
-    )
-    parser.add_argument(
         "--top-k",
         type=int,
         default=5,
@@ -239,9 +230,8 @@ def main() -> int:
     db_path = _resolve(args.db) if args.db else settings.database_default_path
     output_dir = _resolve(args.output_dir) if args.output_dir else ROOT / "outputs" / "eval_reports"
     verified_sql_path = _resolve(args.verified_sql_file) if args.verified_sql_file else settings.verified_sql_path
-    model = args.model if args.model is not None else settings.llm_model
-    temperature = settings.llm_temperature if args.temperature is None else float(args.temperature)
-    config_kw = {"config_path": cfg_path} if cfg_path else {}
+    model = settings.llm_model
+    engine = TextToSQLEngine.from_config(cfg_path, db_path=db_path, top_k=args.top_k)
 
     # --- Resolve benchmark / queries source ---
     default_benchmark_path = ROOT / "data" / "queries" / "eval_benchmark.json"
@@ -269,13 +259,8 @@ def main() -> int:
     for i, question in enumerate(questions, start=1):
         print(f"[{i:2d}/{len(questions)}] {question[:70]}")
         try:
-            run_result = run_single_question(
+            run_result = engine.run_single_question(
                 question=question,
-                db_path=db_path,
-                model=model,
-                temperature=temperature,
-                top_k=args.top_k,
-                **config_kw,
             )
         except Exception as exc:
             print(f"         ERROR during run_single_question: {exc}")

@@ -22,11 +22,11 @@ if str(ROOT / "apps") not in sys.path:
 
 from result_utils import rephrase_reply  # noqa: E402
 
-from src.text_sql.config import get_nutrition_settings  # noqa: E402
+from src.text_sql.engine import TextToSQLEngine  # noqa: E402
 from src.text_sql.semantic_cache import IndexedQuery, SemanticQueryIndex  # noqa: E402
 from src.text_sql.semantic_cache.embedding_model import SentenceEmbeddingModel  # noqa: E402
 from src.text_sql.semantic_cache.intent_classification import classify_query_intent  # noqa: E402
-from src.text_sql.service import read_queries_file, run_single_question  # noqa: E402
+from src.text_sql.utils import get_nutrition_settings, read_queries_file  # noqa: E402
 
 
 def _resolve_repo_path(p: Path) -> Path:
@@ -69,8 +69,6 @@ def main() -> int:
     )
     parser.add_argument("--intent-temperature", type=float, default=0.0)
     parser.add_argument("--config", type=Path, default=None, help="nutrition_text_to_sql.yaml path")
-    parser.add_argument("--model", default=None, help="SQL generation model")
-    parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument(
         "--fail-fast",
@@ -102,9 +100,7 @@ def main() -> int:
         print("No queries in file.", file=sys.stderr)
         return 1
 
-    model = args.model if args.model is not None else settings.llm_model
-    temperature = settings.llm_temperature if args.temperature is None else float(args.temperature)
-    config_kw = {"config_path": cfg_path} if cfg_path else {}
+    engine = TextToSQLEngine.from_config(cfg_path, db_path=db_path, top_k=args.top_k)
 
     import os
 
@@ -124,13 +120,8 @@ def main() -> int:
 
     for i, query in enumerate(queries):
         print(f"[{i + 1}/{len(queries)}] {query[:80]}{'...' if len(query) > 80 else ''}")
-        run_result = run_single_question(
+        run_result = engine.run_single_question(
             question=query,
-            db_path=db_path,
-            model=model,
-            temperature=temperature,
-            top_k=args.top_k,
-            **config_kw,
         )
         sql_exec = run_result.get("sql_execution", {})
         if not sql_exec.get("ok"):

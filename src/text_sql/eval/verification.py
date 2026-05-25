@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from ..results.parse import parse_verified_comparison_value
-from ..sql.execute import execute_sql_list, extract_exec_items, open_sql_database
+from ..sql.execute import execute_sql, extract_exec_items, open_sql_database
 from ..sql.extract import normalize_sql
 
 _MONTH_TOKEN_RE = re.compile(
@@ -308,7 +308,7 @@ def parse_verified_sql_by_query(path: Path) -> dict[int, list[str]]:
         raise FileNotFoundError(f"Verified SQL file not found: {path}")
 
     text = path.read_text(encoding="utf-8")
-    header_re = re.compile(r"(?m)^--\s*Q(\d+)(?:\s+follow-up)?\s*:")
+    header_re = re.compile(r"(?m)^--\s*Q(\d+)\s*:")
     matches = list(header_re.finditer(text))
     by_query: dict[int, list[str]] = {}
 
@@ -341,9 +341,9 @@ def compare_generated_with_verified(
     if abs_tolerance is not None and rel_tolerance is not None:
         abs_tol, rel_tol = abs_tolerance, rel_tolerance
     else:
-        from ..config.settings import get_default_nutrition_settings
+        from ..utils.utils import get_nutrition_settings
 
-        defaults = get_default_nutrition_settings()
+        defaults = get_nutrition_settings(None)
         abs_tol = defaults.eval_abs_tolerance if abs_tolerance is None else abs_tolerance
         rel_tol = defaults.eval_rel_tolerance if rel_tolerance is None else rel_tolerance
 
@@ -352,6 +352,19 @@ def compare_generated_with_verified(
             "checked": False,
             "verdict": "not_checked",
             "reason": "No verified SQL found for this query index",
+            "exact_sql_match": None,
+            "same_result": None,
+            "shape_match": None,
+            "max_numeric_diff": None,
+            "tolerance_used": {"abs": abs_tol, "rel": rel_tol},
+            "generated_results": None,
+            "verified_results": None,
+        }
+    if len(verified_sql_list) != 1:
+        return {
+            "checked": False,
+            "verdict": "not_checked",
+            "reason": f"Expected exactly one verified SQL statement, found {len(verified_sql_list)}",
             "exact_sql_match": None,
             "same_result": None,
             "shape_match": None,
@@ -376,7 +389,8 @@ def compare_generated_with_verified(
         }
 
     db = open_sql_database(db_path)
-    expected_exec = execute_sql_list(db=db, sql_list=verified_sql_list)
+    verified_sql = verified_sql_list[0]
+    expected_exec = execute_sql(db=db, sql=verified_sql)
     if not expected_exec.get("ok", False):
         return {
             "checked": False,
@@ -388,11 +402,25 @@ def compare_generated_with_verified(
             "max_numeric_diff": None,
             "tolerance_used": {"abs": abs_tol, "rel": rel_tol},
             "generated_results": extract_exec_items(sql_exec=sql_exec, generated_sql_list=generated_sql_list),
-            "verified_results": expected_exec.get("results"),
+            "verified_results": [
+                {
+                    "sql": verified_sql,
+                    "ok": expected_exec.get("ok", False),
+                    "raw_output": expected_exec.get("raw_output"),
+                    "error": expected_exec.get("error"),
+                }
+            ],
         }
 
     actual_items = extract_exec_items(sql_exec=sql_exec, generated_sql_list=generated_sql_list)
-    expected_items = expected_exec["results"]
+    expected_items = [
+        {
+            "sql": verified_sql,
+            "ok": expected_exec.get("ok", False),
+            "raw_output": expected_exec.get("raw_output"),
+            "error": expected_exec.get("error"),
+        }
+    ]
 
     actual_sql_norm = [normalize_sql(x["sql"]) for x in actual_items]
     expected_sql_norm = [normalize_sql(x["sql"]) for x in expected_items]

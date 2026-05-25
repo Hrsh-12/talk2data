@@ -19,10 +19,8 @@ import pandas as pd
 from config import (
     APP_CSS,
     DEFAULT_DB_PATH,
-    DEFAULT_MODEL,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_TABLE_ROW_LIMIT,
-    DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     QUEUE_CONCURRENCY,
     QUEUE_MAX_SIZE,
@@ -45,14 +43,27 @@ from result_utils import (
     ground_truth_html,
     rephrase_reply,
 )
+from src.text_sql.engine import TextToSQLEngine
 from src.text_sql.semantic_cache import IndexedQuery, SemanticQueryIndex
-from src.text_sql.service import run_single_question, save_single_trace, warmup_runtime
 from src.text_sql.sql.execute import execute_sql, open_sql_database
+from src.text_sql.utils import save_single_trace
 
 _log = logging.getLogger(__name__)
 
 _semantic_query_index: SemanticQueryIndex | None = None
 _semantic_query_index_load_failed = False
+_text_to_sql_engine: TextToSQLEngine | None = None
+
+
+def _get_text_to_sql_engine() -> TextToSQLEngine:
+    global _text_to_sql_engine
+    if _text_to_sql_engine is None:
+        _text_to_sql_engine = TextToSQLEngine.from_config(
+            None,
+            db_path=DEFAULT_DB_PATH,
+            top_k=DEFAULT_TOP_K,
+        )
+    return _text_to_sql_engine
 
 
 def _try_get_semantic_query_index() -> SemanticQueryIndex | None:
@@ -203,13 +214,8 @@ def chat_handler(message: str, history: list[dict]):
                 return reply, summary_md, table_df
 
     try:
-        result = run_single_question(
+        result = _get_text_to_sql_engine().run_single_question(
             question=message,
-            db_path=DEFAULT_DB_PATH,
-            model=DEFAULT_MODEL,
-            temperature=DEFAULT_TEMPERATURE,
-            top_k=DEFAULT_TOP_K,
-            prefer_verified_templates=True,
         )
     except Exception as exc:
         err = str(exc) or exc.__class__.__name__
@@ -315,7 +321,7 @@ def build_app() -> gr.Blocks:
 
 def main() -> None:
     if WARMUP_ON_START:
-        warmup_runtime(db_path=DEFAULT_DB_PATH, model=DEFAULT_MODEL, temperature=DEFAULT_TEMPERATURE)
+        _get_text_to_sql_engine()
 
     demo = build_app()
     demo.queue(default_concurrency_limit=QUEUE_CONCURRENCY, max_size=QUEUE_MAX_SIZE)

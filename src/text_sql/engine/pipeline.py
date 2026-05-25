@@ -5,67 +5,69 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..adapters.providers import (
-    FileTemplatePromptBuilder,
-    LangChainOpenAIChatClient,
-    LangChainReadOnlyExecutor,
-    SettingsBackedSchemaProvider,
-    cached_chat_openai,
-)
-from ..config.settings import NutriSqlSettings, get_nutrition_settings
-from ..grounding.schema import warmup_schema_cache
-from ..sql.execute import open_sql_database
+from ..adapters.providers import LangChainOpenAIChatClient
+from ..sql.execute import execute_sql, open_sql_database
 from ..sql.extract import extract_sql
+from ..utils.utils import (
+    NutriSqlSettings,
+    build_prompt,
+    get_nutrition_settings,
+    get_table_info_and_samples,
+)
 
 
 class TextToSQLEngine:
     """Orchestrates schema grounding → prompt → LLM → SQL extract → execute → optional repair."""
 
-    def __init__(self, settings: NutriSqlSettings) -> None:
-        self.settings = settings
-
-    @classmethod
-    def from_config(cls, config_path: Path | None = None) -> TextToSQLEngine:
-        return cls(get_nutrition_settings(config_path))
-
-    def warmup(self, db_path: Path, model: str, temperature: float) -> None:
-        warmup_schema_cache(self.settings, db_path)
-        cached_chat_openai(model=model, temperature=temperature)
-
-    def run_single_question(
+    def __init__(
         self,
-        question: str,
+        settings: NutriSqlSettings,
         db_path: Path,
-        model: str,
-        temperature: float,
         top_k: int,
-    ) -> dict[str, Any]:
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise ValueError("OPENAI_API_KEY is not set. Export it or add it to .env.")
+        llm: LangChainOpenAIChatClient | None = None,
+    ) -> None:
         if not db_path.exists():
             raise FileNotFoundError(
                 f"Database not found: {db_path}. Build it first with "
                 "python scripts/build_nutrition_db.py"
             )
 
+        self.settings = settings
+        self.db_path = db_path
+        self.top_k = top_k
+        self._llm = llm or LangChainOpenAIChatClient(
+            model=settings.llm_model,
+            temperature=settings.llm_temperature,
+        )
+        self._db = open_sql_database(db_path)
+        table_info, sample_rows_text = get_table_info_and_samples(settings, db_path)
+        self._prompt = build_prompt(settings, table_info, sample_rows_text, top_k)
+
+    @classmethod
+    def from_config(
+        cls,
+        config_path: Path | None = None,
+        *,
+        db_path: Path,
+        top_k: int,
+    ) -> TextToSQLEngine:
+        return cls(get_nutrition_settings(config_path), db_path=db_path, top_k=top_k)
+
+    def run_single_question(
+        self,
+        question: str,
+    ) -> dict[str, Any]:
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise ValueError("OPENAI_API_KEY is not set. Export it or add it to .env.")
+
         t_start = time.perf_counter()
 
-        schema = SettingsBackedSchemaProvider(self.settings)
-        table_info, sample_rows_text = schema.table_info_and_samples(db_path)
-        prompt = FileTemplatePromptBuilder(self.settings.prompt_template_path).build(
-            table_info=table_info,
-            sample_rows_text=sample_rows_text,
-            top_k=top_k,
-        )
-        llm = LangChainOpenAIChatClient(model=model, temperature=temperature)
-        llm_input = f"{prompt}\n\nUser question:\n{question}"
-        llm_raw_output, usage = llm.complete_tracked(llm_input)
+        llm_input = f"{self._prompt}\n\nUser question:\n{question}"
+        llm_raw_output, usage = self._llm.complete_tracked(llm_input)
         sql_query = extract_sql(llm_raw_output)
         llm_calls = 1
 
-        db = open_sql_database(db_path)
-        executor = LangChainReadOnlyExecutor(db)
-        first_pass_exec = executor.execute(sql_query)
+        first_pass_exec = execute_sql(self._db, sql_query)
         first_pass_exec_ok: bool = bool(first_pass_exec.get("ok", False))
         sql_exec = first_pass_exec
 
@@ -78,9 +80,9 @@ class TextToSQLEngine:
                 f"Broken SQL:\n{sql_query}\n\n"
                 f"Execution error:\n{first_pass_exec.get('error')}\n"
             )
-            repair_llm_output, repair_usage = llm.complete_tracked(repair_prompt)
+            repair_llm_output, repair_usage = self._llm.complete_tracked(repair_prompt)
             repaired_sql = extract_sql(repair_llm_output)
-            sql_exec = executor.execute(repaired_sql)
+            sql_exec = execute_sql(self._db, repaired_sql)
             llm_calls += 1
             # Merge token counts from both calls
             if repair_usage:
@@ -105,7 +107,7 @@ class TextToSQLEngine:
         }
         return {
             "question": question,
-            "llm_input": prompt,
+            "llm_input": self._prompt,
             "llm_raw_output": llm_raw_output,
             "generated_sql": sql_query,
             "generated_sql_list": final_sql_list,
