@@ -50,13 +50,35 @@ def _resolve(p: Path) -> Path:
     return p if p.is_absolute() else (ROOT / p).resolve()
 
 
-def _load_benchmark(path: Path) -> dict[int, dict]:
-    """Return {query_index: entry} from eval_benchmark.json.
+def _load_benchmark(path: Path) -> tuple[list[dict], bool]:
+    """Return (ordered entries, is_noisy) from a single benchmark JSON file.
 
-    Each entry is expected to have at least ``query_index`` and ``category``.
+    Normal benchmarks are sorted by query_index (unique per entry).
+    Noisy benchmarks carry a ``noisy_id`` field (same query_index can appear
+    multiple times with different noise types) and are sorted by noisy_id.
+    Each entry is guaranteed to have ``query_index`` for golden-SQL lookup and
+    ``question`` for the LLM prompt.
     """
     entries = json.loads(path.read_text(encoding="utf-8"))
-    return {int(e["query_index"]): e for e in entries}
+    is_noisy = bool(entries) and "noisy_id" in entries[0]
+    if is_noisy:
+        return sorted(entries, key=lambda e: int(e["noisy_id"])), True
+    return sorted(entries, key=lambda e: int(e["query_index"])), False
+
+
+def _load_benchmarks(paths: list[Path]) -> tuple[list[dict], bool]:
+    """Load one or more benchmark JSON files and return combined entries.
+
+    When multiple files are provided, entries are appended in the order of the
+    provided paths. Normal and noisy benchmarks can be mixed together.
+    """
+    ordered_entries: list[dict] = []
+    is_noisy = False
+    for path in paths:
+        entries, path_is_noisy = _load_benchmark(path)
+        ordered_entries.extend(entries)
+        is_noisy = is_noisy or path_is_noisy
+    return ordered_entries, is_noisy
 
 
 def _preview(value: object, *, max_chars: int = 500) -> str:
@@ -177,13 +199,18 @@ def main() -> int:
     parser.add_argument(
         "--benchmark-file",
         type=Path,
+        nargs="+",
         default=None,
-        help="Path to eval_benchmark.json (default: data/queries/eval_benchmark.json)",
+        help=(
+            "Path to one or more benchmark JSON files. "
+            "Default: data/queries/eval_benchmark.json and data/queries/eval_benchmark_noisy.json "
+            "when both are present."
+        ),
     )
     parser.add_argument(
         "--no-benchmark-tags",
         action="store_true",
-        help="Skip category tagging — use plain queries.txt without eval_benchmark.json",
+        help="Skip category tagging — use plain queries.txt without benchmark JSON files",
     )
     parser.add_argument(
         "--queries-file",
@@ -234,16 +261,27 @@ def main() -> int:
     engine = TextToSQLEngine.from_config(cfg_path, db_path=db_path, top_k=args.top_k)
 
     # --- Resolve benchmark / queries source ---
-    default_benchmark_path = ROOT / "data" / "queries" / "eval_benchmark.json"
-    benchmark_path = _resolve(args.benchmark_file) if args.benchmark_file else default_benchmark_path
+    default_benchmark_paths: list[Path] = []
+    default_benchmark_paths.append(ROOT / "data" / "queries" / "eval_benchmark.json")
+    default_benchmark_paths.append(ROOT / "data" / "queries" / "eval_benchmark_noisy.json")
 
-    use_tags = not args.no_benchmark_tags and benchmark_path.exists()
-    benchmark_by_index: dict[int, dict] = {}
+    if args.benchmark_file:
+        benchmark_paths = [_resolve(p) for p in args.benchmark_file]
+    else:
+        benchmark_paths = [p for p in default_benchmark_paths if p.exists()]
+
+    use_tags = not args.no_benchmark_tags and bool(benchmark_paths)
+    ordered_entries: list[dict] = []
+    is_noisy: bool = False
 
     if use_tags:
-        benchmark_by_index = _load_benchmark(benchmark_path)
-        questions = [benchmark_by_index[i]["question"] for i in sorted(benchmark_by_index)]
-        print(f"Loaded {len(questions)} questions from {benchmark_path.name} (with category tags)")
+        ordered_entries, is_noisy = _load_benchmarks(benchmark_paths)
+        questions = [e["question"] for e in ordered_entries]
+        names = ", ".join(p.name for p in benchmark_paths)
+        mode_label = "with category tags"
+        if is_noisy:
+            mode_label += " (including noisy entries)"
+        print(f"Loaded {len(questions)} questions from {names} ({mode_label})")
     else:
         queries_file = _resolve(args.queries_file) if args.queries_file else settings.queries_txt_path
         questions = read_queries_file(queries_file)
@@ -280,7 +318,12 @@ def main() -> int:
                 "usage": {},
             }
 
-        verified_sql_list = verified_sql_by_query.get(i, [])
+        # Resolve the query_index for golden-SQL lookup.
+        # For normal benchmarks i == query_index; for noisy benchmarks they diverge.
+        entry_meta = ordered_entries[i - 1] if use_tags else {}
+        q_idx = int(entry_meta.get("query_index", i))
+
+        verified_sql_list = verified_sql_by_query.get(q_idx, [])
         comparison = compare_generated_with_verified(
             db_path=db_path,
             generated_sql_list=run_result.get("generated_sql_list", [run_result.get("generated_sql", "")]),
@@ -289,15 +332,20 @@ def main() -> int:
         )
 
         entry: dict = {
-            "query_index": i,
+            "query_index": q_idx,
             "question": question,
             **run_result,
             "comparison": comparison,
         }
 
-        # Inject category from benchmark JSON if available
-        if use_tags and i in benchmark_by_index:
-            entry["category"] = benchmark_by_index[i].get("category")
+        # Inject metadata from benchmark JSON if available
+        if use_tags:
+            entry["category"] = entry_meta.get("category")
+            if "noise_type" in entry_meta:
+                entry["noise_type"] = entry_meta["noise_type"]
+                entry["original_question"] = entry_meta.get("original_question", "")
+            if "noisy_id" in entry_meta:
+                entry["noisy_id"] = int(entry_meta["noisy_id"])
 
         verdict = comparison.get("verdict", "not_checked")
         repaired = run_result.get("repaired_sql") is not None
@@ -311,6 +359,28 @@ def main() -> int:
 
     # --- Aggregate ---
     report = aggregate_verdicts(results, model=model, db_path=str(db_path))
+
+    # --- Per-noise-type breakdown (noisy benchmark only) ---
+    per_noise_type: dict = {}
+    if is_noisy:
+        from collections import defaultdict
+        noise_stats: dict = defaultdict(lambda: {"n": 0, "right": 0, "wrong": 0, "not_checked": 0})
+        for r in results:
+            nt = r.get("noise_type")
+            if nt:
+                s = noise_stats[nt]
+                s["n"] += 1
+                v = (r.get("comparison") or {}).get("verdict", "not_checked")
+                if v in s:
+                    s[v] += 1
+        per_noise_type = {
+            nt: {
+                **s,
+                "accuracy": s["right"] / (s["right"] + s["wrong"])
+                if (s["right"] + s["wrong"]) > 0 else None,
+            }
+            for nt, s in sorted(noise_stats.items())
+        }
 
     # --- Serialize ---
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -336,6 +406,7 @@ def main() -> int:
         "total_tokens": report.total_tokens,
         "avg_llm_calls_per_query": report.avg_llm_calls_per_query,
         "per_category": report.per_category,
+        "per_noise_type": per_noise_type,
         "per_query": report.per_query,
         "raw_results": [
             {
@@ -353,6 +424,18 @@ def main() -> int:
 
     print()
     _print_summary(report)
+
+    if per_noise_type:
+        sep = "-" * 52
+        print(sep)
+        print("PER-NOISE-TYPE ACCURACY")
+        print(sep)
+        for nt, s in per_noise_type.items():
+            acc = s["accuracy"]
+            acc_str = f"{acc * 100:.1f}%" if acc is not None else "n/a"
+            print(f"  {nt:<20} n={s['n']:2d}  accuracy={acc_str}")
+        print(sep)
+
     print(f"\nReport saved to: {report_path}")
     print(f"Latest copy   : {latest_path}")
 

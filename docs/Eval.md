@@ -155,7 +155,7 @@ python scripts/run_eval.py --no-benchmark-tags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--benchmark-file` | `data/queries/eval_benchmark.json` | Tagged benchmark JSON |
+| `--benchmark-file` | `data/queries/eval_benchmark.json` and `data/queries/eval_benchmark_noisy.json` | Tagged benchmark JSON, including noisy benchmark by default |
 | `--no-benchmark-tags` | off | Use `queries.txt`, skip categories |
 | `--queries-file` | from config | Override plain question file |
 | `--verified-sql-file` | from config | Override golden SQL file |

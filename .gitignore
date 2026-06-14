@@ -2,6 +2,7 @@ outputs/
 output/
 data/
 database/
+.gradio/
 
 # Local environment/secrets
 .env

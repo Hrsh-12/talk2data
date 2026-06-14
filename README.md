@@ -128,7 +128,7 @@ Saved to:
 Notes:
 - LLM routing to hardcoded verified templates is disabled; every query is inferred by the model.
 - Verified SQL parser strips comments/result blocks before extracting executable SQL.
-- Verified SQL coverage now includes queries `Q1`-`Q28` in `data/queries /queries_verified.sql`.
+- Verified SQL coverage now includes queries `Q1`-`Q28` in `data/queries/queries_verified.sql`.
 
 ### Step 5: Launch Gradio demo
 

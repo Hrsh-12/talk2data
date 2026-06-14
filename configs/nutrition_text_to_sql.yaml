@@ -27,6 +27,6 @@ evaluation:
   rel_tolerance: 1.0e-9
 
 paths:
-  verified_sql_relative_path: data/queries /queries_verified.sql
+  verified_sql_relative_path: data/queries/queries_verified.sql
   queries_txt_relative_path: data/queries /queries.txt
   output_dir_relative_path: outputs

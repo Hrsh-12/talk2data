@@ -140,7 +140,7 @@ def load_nutrition_settings(
         eval_rel_tolerance=float(eval_block.get("rel_tolerance", 1e-9)),
         verified_sql_path=resolve_path(
             root,
-            str(paths.get("verified_sql_relative_path", "data/queries /queries_verified.sql")),
+            str(paths.get("verified_sql_relative_path", "data/queries/queries_verified.sql")),
         ),
         queries_txt_path=resolve_path(
             root,

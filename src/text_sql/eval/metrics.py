@@ -171,6 +171,8 @@ def aggregate_verdicts(
                 "question": r.get("question", ""),
                 "query_index": r.get("query_index"),
                 "category": category,
+                "noise_type": r.get("noise_type"),
+                "original_question": r.get("original_question"),
                 "verdict": verdict,
                 "repaired": repaired,
                 "latency_ms": latency,
